@@ -148,6 +148,24 @@ index e1772ab1d..d75c97cb3 100644
              kv_offloading_size=self.kv_offloading_size,
              kv_offloading_backend=self.kv_offloading_backend,
          )
+diff --git a/vllm/model_executor/layers/mamba/abstract.py b/vllm/model_executor/layers/mamba/abstract.py
+index 3c6b01394..674a56236 100644
+--- a/vllm/model_executor/layers/mamba/abstract.py
++++ b/vllm/model_executor/layers/mamba/abstract.py
+@@ -55,6 +55,13 @@ class MambaBase(AttentionLayerBase):
+                 if vllm_config.speculative_config
+                 else 0
+             ),
++            mamba_latest_coarse_block_size=vllm_config.cache_config.block_size,
++            mamba_latest_coarse_checkpoints=(
++                vllm_config.cache_config.mamba_latest_coarse_checkpoints
++            ),
++            mamba_latest_coarse_min_gap=(
++                vllm_config.cache_config.mamba_latest_coarse_min_gap
++            ),
+         )
+ 
+     def get_attn_backend(self) -> type[AttentionBackend]:
 diff --git a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
 index c13ea5393..6af0e5f4a 100644
 --- a/vllm/model_executor/models/config.py
@@ -189,7 +207,7 @@ index 59f6ca9bf..0f78bd9a6 100644
                 1 + num_speculative_blocks of each request.
      """
 diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
-index 4b62d2a4c..dae1e3466 100644
+index 4b62d2a4c..8cad4f487 100644
 --- a/vllm/v1/core/block_pool.py
 +++ b/vllm/v1/core/block_pool.py
 @@ -1,6 +1,7 @@
@@ -255,7 +273,7 @@ index 4b62d2a4c..dae1e3466 100644
      def cache_full_blocks(
          self,
          request: Request,
-@@ -317,6 +352,69 @@ class BlockPool:
+@@ -317,6 +352,56 @@ class BlockPool:
                  )
              )
  
@@ -287,45 +305,32 @@ index 4b62d2a4c..dae1e3466 100644
 +        if block.is_null:
 +            return
 +
-+        first_boundary = block_idx * block_size + self.hash_block_size
-+        for partial_boundary in range(
-+            first_boundary, boundary_tokens + 1, self.hash_block_size
-+        ):
-+            partial_hash_idx = partial_boundary // self.hash_block_size - 1
-+            partial_valid_tokens = partial_boundary % block_size
-+            if partial_hash_idx >= len(request.block_hashes):
-+                break
-+            if partial_valid_tokens == 0:
-+                continue
++        block_hash_with_group_id = make_block_hash_with_group_id(
++            request.block_hashes[hash_idx], kv_cache_group_id
++        )
++        old_entry = self.cached_partial_block_hash_to_block.get(
++            block_hash_with_group_id
++        )
++        if old_entry is not None:
++            old_hashes = self.partial_block_id_to_hashes.get(old_entry.block.block_id)
++            if old_hashes is not None:
++                old_hashes.discard(block_hash_with_group_id)
++                if not old_hashes:
++                    self.partial_block_id_to_hashes.pop(
++                        old_entry.block.block_id, None
++                    )
 +
-+            block_hash_with_group_id = make_block_hash_with_group_id(
-+                request.block_hashes[partial_hash_idx], kv_cache_group_id
-+            )
-+            old_entry = self.cached_partial_block_hash_to_block.get(
-+                block_hash_with_group_id
-+            )
-+            if old_entry is not None:
-+                old_hashes = self.partial_block_id_to_hashes.get(
-+                    old_entry.block.block_id
-+                )
-+                if old_hashes is not None:
-+                    old_hashes.discard(block_hash_with_group_id)
-+                    if not old_hashes:
-+                        self.partial_block_id_to_hashes.pop(
-+                            old_entry.block.block_id, None
-+                        )
-+
-+            self.cached_partial_block_hash_to_block[block_hash_with_group_id] = (
-+                PartialKVCacheBlock(block=block, valid_tokens=partial_valid_tokens)
-+            )
-+            self.partial_block_id_to_hashes.setdefault(block.block_id, set()).add(
-+                block_hash_with_group_id
-+            )
++        self.cached_partial_block_hash_to_block[block_hash_with_group_id] = (
++            PartialKVCacheBlock(block=block, valid_tokens=valid_tokens)
++        )
++        self.partial_block_id_to_hashes.setdefault(block.block_id, set()).add(
++            block_hash_with_group_id
++        )
 +
      def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
          """Get new blocks from the free block pool.
  
-@@ -364,6 +462,8 @@ class BlockPool:
+@@ -364,6 +449,8 @@ class BlockPool:
          if self.metrics_collector:
              self.metrics_collector.on_block_evicted(block)
  
@@ -334,7 +339,7 @@ index 4b62d2a4c..dae1e3466 100644
          block_hash = block.block_hash
          if block_hash is None:
              # The block doesn't have hash, eviction is not needed
-@@ -389,6 +489,13 @@ class BlockPool:
+@@ -389,6 +476,13 @@ class BlockPool:
              )
          return True
  
@@ -348,7 +353,7 @@ index 4b62d2a4c..dae1e3466 100644
      def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
          """Touch a block increases its reference count by 1, and may remove
          the block from the free queue. This is used when a block is hit by
-@@ -461,6 +568,8 @@ class BlockPool:
+@@ -461,6 +555,8 @@ class BlockPool:
  
          # Remove all hashes so that no new blocks will hit.
          self.cached_block_hash_to_block = BlockHashToBlockMap()
@@ -358,7 +363,7 @@ index 4b62d2a4c..dae1e3466 100644
          # Remove all hashes from all blocks.
          for block in self.blocks:
 diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
-index eaa95dfe4..0bfd0614c 100644
+index eaa95dfe4..49646dca2 100644
 --- a/vllm/v1/core/kv_cache_coordinator.py
 +++ b/vllm/v1/core/kv_cache_coordinator.py
 @@ -2,6 +2,7 @@
@@ -479,7 +484,19 @@ index eaa95dfe4..0bfd0614c 100644
      def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
          """
          Cache the blocks for the request.
-@@ -252,6 +316,11 @@ class KVCacheCoordinator(ABC):
+@@ -188,6 +252,11 @@ class KVCacheCoordinator(ABC):
+         for manager in self.single_type_managers:
+             manager.cache_blocks(request, num_computed_tokens)
+ 
++    def finalize_request_cache(self, request: Request) -> None:
++        """Commit cache state that is intentionally delayed until request end."""
++        for manager in self.single_type_managers:
++            manager.finalize_request_cache(request)
++
+     def free(self, request_id: str) -> None:
+         """
+         Free the blocks for the request.
+@@ -252,6 +321,11 @@ class KVCacheCoordinator(ABC):
          for manager in self.single_type_managers:
              manager.new_step_starts()
  
@@ -491,7 +508,7 @@ index eaa95dfe4..0bfd0614c 100644
  
  class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
      """
-@@ -270,6 +339,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
+@@ -270,6 +344,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
          dcp_world_size: int,
          pcp_world_size: int,
          hash_block_size: int,
@@ -499,7 +516,7 @@ index eaa95dfe4..0bfd0614c 100644
          metrics_collector: KVCacheMetricsCollector | None = None,
      ):
          super().__init__(
-@@ -281,6 +351,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
+@@ -281,6 +356,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
              dcp_world_size=dcp_world_size,
              pcp_world_size=pcp_world_size,
              hash_block_size=hash_block_size,
@@ -507,7 +524,7 @@ index eaa95dfe4..0bfd0614c 100644
              metrics_collector=metrics_collector,
          )
          self.num_single_type_manager = len(self.single_type_managers)
-@@ -316,6 +387,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
+@@ -316,6 +392,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
          dcp_world_size: int,
          pcp_world_size: int,
          hash_block_size: int,
@@ -515,7 +532,7 @@ index eaa95dfe4..0bfd0614c 100644
          metrics_collector: KVCacheMetricsCollector | None = None,
      ):
          super().__init__(
-@@ -327,6 +399,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
+@@ -327,6 +404,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
              dcp_world_size=dcp_world_size,
              pcp_world_size=pcp_world_size,
              hash_block_size=hash_block_size,
@@ -523,7 +540,7 @@ index eaa95dfe4..0bfd0614c 100644
              metrics_collector=metrics_collector,
          )
          self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
-@@ -381,6 +454,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+@@ -381,6 +459,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
          dcp_world_size: int,
          pcp_world_size: int,
          hash_block_size: int,
@@ -531,7 +548,7 @@ index eaa95dfe4..0bfd0614c 100644
          metrics_collector: KVCacheMetricsCollector | None = None,
      ):
          super().__init__(
-@@ -392,6 +466,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+@@ -392,6 +471,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
              dcp_world_size=dcp_world_size,
              pcp_world_size=pcp_world_size,
              hash_block_size=hash_block_size,
@@ -539,7 +556,7 @@ index eaa95dfe4..0bfd0614c 100644
              metrics_collector=metrics_collector,
          )
          # hash_block_size: the block size used to compute block hashes.
-@@ -445,10 +520,63 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+@@ -445,10 +525,63 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
          # The LCM of the block sizes of all attention types.
          # The cache hit length must be a multiple of the LCM of the block sizes
          # to make sure the cache hit length is a multiple of the block size of
@@ -606,7 +623,7 @@ index eaa95dfe4..0bfd0614c 100644
  
      def find_longest_cache_hit(
          self,
-@@ -481,8 +609,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+@@ -481,8 +614,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
              )
  
          num_groups = len(self.kv_cache_config.kv_cache_groups)
@@ -617,7 +634,7 @@ index eaa95dfe4..0bfd0614c 100644
  
          # Simple hybrid (1 full attn + 1 other): one iteration suffices.
          # Full attn is always first if it exists. This avoids EAGLE drops
-@@ -499,6 +629,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+@@ -499,6 +634,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
  
              for spec, group_ids, manager_cls in self.attention_groups:
                  is_full_attn = isinstance(spec, FullAttentionSpec)
@@ -625,7 +642,7 @@ index eaa95dfe4..0bfd0614c 100644
  
                  # Full attention: reuse cached blocks (downward-closed property)
                  cached_blocks = hit_blocks_by_group[group_ids[0]]
-@@ -510,10 +641,25 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+@@ -510,10 +646,25 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                      # the last iteration.
                      num_blocks = curr_hit_length // spec.block_size
                      curr_hit_length = num_blocks * spec.block_size
@@ -652,7 +669,7 @@ index eaa95dfe4..0bfd0614c 100644
                          kv_cache_group_ids=group_ids,
                          block_pool=self.block_pool,
                          kv_cache_spec=spec,
-@@ -521,6 +667,17 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+@@ -521,6 +672,17 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                          alignment_tokens=self.lcm_block_size,
                      )
                      curr_hit_length = len(hit_blocks[0]) * spec.block_size
@@ -670,7 +687,7 @@ index eaa95dfe4..0bfd0614c 100644
                      for group_id, blocks in zip(group_ids, hit_blocks):
                          hit_blocks_by_group[group_id] = blocks
  
-@@ -539,6 +696,28 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+@@ -539,6 +701,28 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                  if (blks := hit_blocks_by_group[group_id]) is not None:
                      del blks[num_blocks:]
  
@@ -699,7 +716,7 @@ index eaa95dfe4..0bfd0614c 100644
          return tuple(
              blocks if blocks is not None else [] for blocks in hit_blocks_by_group
          ), hit_length
-@@ -553,6 +732,7 @@ def get_kv_cache_coordinator(
+@@ -553,6 +737,7 @@ def get_kv_cache_coordinator(
      dcp_world_size: int,
      pcp_world_size: int,
      hash_block_size: int,
@@ -707,7 +724,7 @@ index eaa95dfe4..0bfd0614c 100644
      metrics_collector: KVCacheMetricsCollector | None = None,
  ) -> KVCacheCoordinator:
      if not enable_caching:
-@@ -564,6 +744,7 @@ def get_kv_cache_coordinator(
+@@ -564,6 +749,7 @@ def get_kv_cache_coordinator(
              dcp_world_size=dcp_world_size,
              pcp_world_size=pcp_world_size,
              hash_block_size=hash_block_size,
@@ -715,7 +732,7 @@ index eaa95dfe4..0bfd0614c 100644
              metrics_collector=metrics_collector,
          )
      if len(kv_cache_config.kv_cache_groups) == 1:
-@@ -576,6 +757,7 @@ def get_kv_cache_coordinator(
+@@ -576,6 +762,7 @@ def get_kv_cache_coordinator(
              dcp_world_size=dcp_world_size,
              pcp_world_size=pcp_world_size,
              hash_block_size=hash_block_size,
@@ -723,7 +740,7 @@ index eaa95dfe4..0bfd0614c 100644
              metrics_collector=metrics_collector,
          )
      return HybridKVCacheCoordinator(
-@@ -587,5 +769,6 @@ def get_kv_cache_coordinator(
+@@ -587,5 +774,6 @@ def get_kv_cache_coordinator(
          dcp_world_size=dcp_world_size,
          pcp_world_size=pcp_world_size,
          hash_block_size=hash_block_size,
@@ -731,7 +748,7 @@ index eaa95dfe4..0bfd0614c 100644
          metrics_collector=metrics_collector,
      )
 diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
-index dcec5e05b..1d4ccccbe 100644
+index dcec5e05b..4f31e2974 100644
 --- a/vllm/v1/core/kv_cache_manager.py
 +++ b/vllm/v1/core/kv_cache_manager.py
 @@ -7,16 +7,16 @@ from dataclasses import dataclass
@@ -845,15 +862,17 @@ index dcec5e05b..1d4ccccbe 100644
  
          # P/D: delay caching blocks if we have to recv from
          # remote. Update state for locally cached blocks.
-@@ -434,6 +462,7 @@ class KVCacheManager:
+@@ -434,6 +462,9 @@ class KVCacheManager:
          Args:
              request: The request to free the blocks.
          """
 +        self._pending_partial_hits.pop(request.request_id, None)
++        if self.enable_caching:
++            self.coordinator.finalize_request_cache(request)
          self.coordinator.free(request.request_id)
  
      def remove_skipped_blocks(
-@@ -547,6 +576,12 @@ class KVCacheManager:
+@@ -547,6 +578,12 @@ class KVCacheManager:
              ids.extend(mgr.take_new_block_ids())
          return ids
  
@@ -867,10 +886,25 @@ index dcec5e05b..1d4ccccbe 100644
          """Called when a new step is started."""
          self.coordinator.new_step_starts()
 diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
-index 9ab5af0f6..871798969 100644
+index 9ab5af0f6..c334f9f19 100644
 --- a/vllm/v1/core/kv_cache_utils.py
 +++ b/vllm/v1/core/kv_cache_utils.py
-@@ -155,6 +155,16 @@ class KVCacheBlock:
+@@ -18,12 +18,14 @@ from vllm.utils.hashing import sha256_cbor, xxhash_cbor
+ from vllm.utils.math_utils import cdiv
+ from vllm.utils.mem_utils import format_gib
+ from vllm.v1.kv_cache_interface import (
++    AttentionSpec,
+     ChunkedLocalAttentionSpec,
+     FullAttentionSpec,
+     KVCacheConfig,
+     KVCacheGroupSpec,
+     KVCacheSpec,
+     KVCacheTensor,
++    MambaSpec,
+     SlidingWindowSpec,
+     UniformTypeKVCacheSpecs,
+ )
+@@ -155,6 +157,16 @@ class KVCacheBlock:
          )
  
  
@@ -887,6 +921,52 @@ index 9ab5af0f6..871798969 100644
  class FreeKVCacheBlockQueue:
      """This class organizes a list of KVCacheBlock objects to a doubly linked
      list of free blocks. We implement this class instead of using Python
+@@ -951,6 +963,37 @@ def unify_kv_cache_spec_page_size(
+     return new_kv_cache_spec
+ 
+ 
++def set_latest_mamba_coarse_block_size(
++    kv_cache_spec: dict[str, KVCacheSpec],
++) -> dict[str, KVCacheSpec]:
++    coarse_block_size = max(
++        (
++            spec.block_size
++            for spec in kv_cache_spec.values()
++            if isinstance(spec, AttentionSpec)
++        ),
++        default=None,
++    )
++    if coarse_block_size is None:
++        return kv_cache_spec
++
++    new_kv_cache_spec: dict[str, KVCacheSpec] | None = None
++    for layer_name, layer_spec in kv_cache_spec.items():
++        if (
++            isinstance(layer_spec, MambaSpec)
++            and layer_spec.mamba_cache_mode == "latest"
++            and layer_spec.mamba_latest_coarse_block_size != coarse_block_size
++        ):
++            if new_kv_cache_spec is None:
++                new_kv_cache_spec = dict(kv_cache_spec)
++            new_kv_cache_spec[layer_name] = replace(
++                layer_spec,
++                mamba_latest_coarse_block_size=coarse_block_size,
++            )
++
++    return kv_cache_spec if new_kv_cache_spec is None else new_kv_cache_spec
++
++
+ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
+     # kv_cache_spec is an empty dict for attention free models
+     return not kv_cache_spec
+@@ -1255,6 +1298,7 @@ def get_kv_cache_groups(
+     # the page size of the layers. For cases cannot be unified, this function
+     # will raise an error.
+     kv_cache_spec = unify_kv_cache_spec_page_size(kv_cache_spec)
++    kv_cache_spec = set_latest_mamba_coarse_block_size(kv_cache_spec)
+     # Model contains multiple attention types, but KV cache of all layers
+     # have the same physical memory per block per layer. Split the layers
+     # into groups with the same number of layers, and thus same total page
 diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
 index bdb97deca..28062e300 100644
 --- a/vllm/v1/core/sched/output.py
@@ -1248,7 +1328,7 @@ index fe524ccac..c30c610c8 100644
  
          # NOTE(Kuntai): this function is designed for multiple purposes:
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
-index fa5395685..4f8ac0b86 100644
+index fa5395685..a5775ec8f 100644
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
 @@ -39,6 +39,7 @@ class SingleTypeKVCacheManager(ABC):
@@ -1289,7 +1369,18 @@ index fa5395685..4f8ac0b86 100644
      def cache_blocks(self, request: Request, num_tokens: int) -> None:
          """
          Cache the blocks for the request.
-@@ -282,10 +292,11 @@ class SingleTypeKVCacheManager(ABC):
+@@ -273,6 +283,10 @@ class SingleTypeKVCacheManager(ABC):
+ 
+         self.num_cached_block[request.request_id] = num_full_blocks
+ 
++    def finalize_request_cache(self, request: Request) -> None:
++        """Commit any request-local cache state before the request is freed."""
++        return None
++
+     def free(self, request_id: str) -> None:
+         """
+         Free the blocks for the request.
+@@ -282,10 +296,11 @@ class SingleTypeKVCacheManager(ABC):
          """
          # Default to [] in case a request is freed (aborted) before alloc.
          req_blocks = self.req_to_blocks.pop(request_id, [])
@@ -1302,7 +1393,7 @@ index fa5395685..4f8ac0b86 100644
  
          self.block_pool.free_blocks(ordered_blocks)
          self.num_cached_block.pop(request_id, None)
-@@ -466,6 +477,20 @@ class FullAttentionManager(SingleTypeKVCacheManager):
+@@ -466,6 +481,20 @@ class FullAttentionManager(SingleTypeKVCacheManager):
                  computed.pop()
          return computed_blocks
  
@@ -1323,7 +1414,7 @@ index fa5395685..4f8ac0b86 100644
      def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
          blocks = self.req_to_blocks[running_request_id]
          num_common_blocks = 0
-@@ -774,7 +799,7 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -774,12 +803,125 @@ class MambaManager(SingleTypeKVCacheManager):
          self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
          self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
          self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
@@ -1332,16 +1423,154 @@ index fa5395685..4f8ac0b86 100644
              # Mapping from request ID to the index of the block
              # allocated in the previous step
              self.last_state_block_idx: dict[str, int] = {}
-@@ -840,7 +865,7 @@ class MambaManager(SingleTypeKVCacheManager):
++            self.current_state_block_idx: dict[str, int] = {}
+             # The set of the requests that have been allocated blocks
+             self._allocated_block_reqs: set[str] = set()
++        if self.mamba_cache_mode == "latest":
++            self.latest_checkpoint_block_idx: dict[str, int] = {}
++            self.coarse_checkpoint_block_idx: dict[str, int] = {}
++            self.coarse_checkpoint_block_size = (
++                kv_cache_spec.mamba_latest_coarse_block_size
++            )
++            self.coarse_checkpoint_count = (
++                kv_cache_spec.mamba_latest_coarse_checkpoints
++            )
++            self.coarse_checkpoint_min_gap = (
++                kv_cache_spec.mamba_latest_coarse_min_gap
++            )
++
++    def _use_latest_block_reuse(self) -> bool:
++        return (
++            self.mamba_cache_mode == "latest" and self.num_speculative_blocks == 0
++        )
++
++    def _latest_state_idx(self, num_tokens: int) -> int:
++        return cdiv(num_tokens, self.block_size) - 1
++
++    def _checkpoint_indices(self, request_id: str) -> set[int]:
++        checkpoint_indices: set[int] = set()
++        if self.mamba_cache_mode != "latest":
++            return checkpoint_indices
++        latest_idx = self.latest_checkpoint_block_idx.get(request_id)
++        coarse_idx = self.coarse_checkpoint_block_idx.get(request_id)
++        if latest_idx is not None:
++            checkpoint_indices.add(latest_idx)
++        if coarse_idx is not None:
++            checkpoint_indices.add(coarse_idx)
++        return checkpoint_indices
++
++    def _is_checkpoint_idx(self, request_id: str, block_idx: int) -> bool:
++        return block_idx in self._checkpoint_indices(request_id)
++
++    def _maybe_free_unqueued_checkpoint(self, request_id: str, block_idx: int) -> None:
++        if self.mamba_cache_mode != "latest":
++            return
++        if block_idx in self._checkpoint_indices(request_id):
++            return
++        if block_idx == self.current_state_block_idx.get(request_id):
++            return
++        blocks = self.req_to_blocks.get(request_id)
++        if blocks is None or block_idx < 0 or block_idx >= len(blocks):
++            return
++        block = blocks[block_idx]
++        if block.is_null:
++            return
++        self.block_pool.free_blocks([block])
++        blocks[block_idx] = self._null_block
++
++    def _is_coarse_checkpoint_boundary(self, block_idx: int) -> bool:
++        if (
++            self.coarse_checkpoint_block_size is None
++            or self.coarse_checkpoint_count <= 0
++        ):
++            return False
++        boundary_tokens = (block_idx + 1) * self.block_size
++        return boundary_tokens % self.coarse_checkpoint_block_size == 0
++
++    def _target_coarse_checkpoint_idx(self, request: Request) -> int | None:
++        if (
++            self.coarse_checkpoint_block_size is None
++            or self.coarse_checkpoint_count <= 0
++        ):
++            return None
++
++        latest_cache_position = (
++            request.num_tokens - request.num_tokens % self.block_size
++        )
++        candidate = (
++            latest_cache_position
++            - latest_cache_position % self.coarse_checkpoint_block_size
++        )
++        while candidate > 0:
++            if latest_cache_position - candidate >= self.coarse_checkpoint_min_gap:
++                return candidate // self.block_size - 1
++            candidate -= self.coarse_checkpoint_block_size
++        return None
++
++    def _queue_latest_checkpoint(self, request: Request, block_idx: int) -> None:
++        request_id = request.request_id
++        blocks = self.req_to_blocks[request_id]
++        if block_idx < 0 or block_idx >= len(blocks):
++            return
++        block = blocks[block_idx]
++        if block.is_null:
++            return
++
++        old_latest_idx = self.latest_checkpoint_block_idx.get(request_id)
++        self.latest_checkpoint_block_idx[request_id] = block_idx
++        if old_latest_idx is not None and old_latest_idx != block_idx:
++            self._maybe_free_unqueued_checkpoint(request_id, old_latest_idx)
++
++        if self._target_coarse_checkpoint_idx(request) != block_idx:
++            return
++        old_coarse_idx = self.coarse_checkpoint_block_idx.get(request_id)
++        self.coarse_checkpoint_block_idx[request_id] = block_idx
++        if old_coarse_idx is not None and old_coarse_idx != block_idx:
++            self._maybe_free_unqueued_checkpoint(request_id, old_coarse_idx)
++
++    def _latest_coarse_checkpoint_cacheable(self, request: Request) -> int | None:
++        coarse_idx = self.coarse_checkpoint_block_idx.get(request.request_id)
++        latest_idx = self.latest_checkpoint_block_idx.get(request.request_id)
++        if coarse_idx is None or latest_idx is None:
++            return None
++        latest_boundary = (latest_idx + 1) * self.block_size
++        coarse_boundary = (coarse_idx + 1) * self.block_size
++        if latest_boundary - coarse_boundary < self.coarse_checkpoint_min_gap:
++            return None
++        return coarse_idx
+ 
+     @classmethod
+     def find_longest_cache_hit(
+@@ -839,8 +981,27 @@ class MambaManager(SingleTypeKVCacheManager):
+         # that we might actually need.
          num_computed_tokens = max(0, num_computed_tokens - self.num_speculative_blocks)
  
++        if self.mamba_cache_mode == "latest":
++            num_skipped_tokens = self.get_num_skipped_tokens(num_computed_tokens)
++            if num_skipped_tokens <= 0:
++                return
++            blocks = self.req_to_blocks[request_id]
++            num_skipped_blocks = min(num_skipped_tokens // self.block_size, len(blocks))
++            checkpoint_indices = self._checkpoint_indices(request_id)
++            current_state_idx = self.current_state_block_idx.get(request_id)
++            removed_blocks: list[KVCacheBlock] = []
++            for i in range(num_skipped_blocks - 1, -1, -1):
++                if i == current_state_idx or i in checkpoint_indices:
++                    continue
++                if blocks[i].is_null:
++                    continue
++                removed_blocks.append(blocks[i])
++                blocks[i] = self._null_block
++            self.block_pool.free_blocks(removed_blocks)
++            return
++
          super().remove_skipped_blocks(request_id, num_computed_tokens)
 -        if self.mamba_cache_mode == "align":
 +        if self.mamba_cache_mode in ("align", "latest"):
              # `last_state_block_idx` refers to the block index allocated two steps ago.
              # The block allocated in the previous step is used to copy Mamba states
              # into the block allocated in the current step; the earlier block is
-@@ -883,7 +908,7 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -883,7 +1044,7 @@ class MambaManager(SingleTypeKVCacheManager):
              # that kv_cache_manager will think there is no enough blocks to allocate now
              # and don't schedule it in the current step.
              return self.block_pool.num_gpu_blocks + 1
@@ -1350,7 +1579,101 @@ index fa5395685..4f8ac0b86 100644
              # Allocate extra `num_speculative_blocks` blocks for
              # speculative decoding (MTP/EAGLE) with linear attention.
              if self.num_speculative_blocks > 0:
-@@ -934,7 +959,7 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -910,6 +1071,29 @@ class MambaManager(SingleTypeKVCacheManager):
+             num_required_blocks = (
+                 cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
+             )
++            if self._use_latest_block_reuse():
++                num_required_blocks = cdiv(num_tokens, self.block_size)
++                num_new_blocks = 0
++                if num_required_blocks > 0:
++                    current_state_idx = num_required_blocks - 1
++                    num_req_blocks = len(self.req_to_blocks[request_id])
++                    num_local_blocks = len(new_computed_blocks) + num_req_blocks
++                    if request_id in self._allocated_block_reqs:
++                        prev_state_idx = self.current_state_block_idx.get(request_id)
++                        if (
++                            prev_state_idx is None
++                            or current_state_idx > prev_state_idx
++                            and self._is_checkpoint_idx(request_id, prev_state_idx)
++                        ):
++                            num_new_blocks = 1
++                    elif current_state_idx >= num_local_blocks:
++                        num_new_blocks = 1
++
++                num_evictable_computed_blocks = self._get_num_evictable_blocks(
++                    new_computed_blocks
++                )
++                return num_new_blocks + num_evictable_computed_blocks
++
+             num_new_blocks = (
+                 num_required_blocks
+                 - len(new_computed_blocks)
+@@ -930,11 +1114,71 @@ class MambaManager(SingleTypeKVCacheManager):
+             )
+             return num_new_blocks + num_evictable_computed_blocks
+ 
++    def _allocate_latest_reused_blocks(
++        self, request_id: str, num_tokens_main_model: int
++    ) -> list[KVCacheBlock]:
++        req_blocks: list[KVCacheBlock] = self.req_to_blocks[request_id]
++        num_required_blocks = cdiv(num_tokens_main_model, self.block_size)
++        if num_required_blocks == 0:
++            return []
++
++        current_state_idx = num_required_blocks - 1
++        prev_block_len = len(req_blocks)
++        blocks_allocated = request_id in self._allocated_block_reqs
++
++        if not blocks_allocated:
++            if current_state_idx < prev_block_len:
++                self.current_state_block_idx[request_id] = current_state_idx
++                self._allocated_block_reqs.add(request_id)
++                return []
++            if prev_block_len < current_state_idx:
++                req_blocks.extend(
++                    [self._null_block for _ in range(prev_block_len, current_state_idx)]
++                )
++            new_block = self.block_pool.get_new_blocks(1)[0]
++            req_blocks.append(new_block)
++            self.current_state_block_idx[request_id] = current_state_idx
++            self._allocated_block_reqs.add(request_id)
++            return req_blocks[prev_block_len:]
++
++        prev_state_idx = self.current_state_block_idx.get(request_id)
++        if prev_state_idx is None:
++            prev_state_idx = prev_block_len - 1
++        if current_state_idx <= prev_state_idx:
++            return []
++
++        prev_state_block = req_blocks[prev_state_idx]
++        preserve_previous_state = self._is_checkpoint_idx(
++            request_id, prev_state_idx
++        ) or (not prev_state_block.is_null and prev_state_block.block_hash is not None)
++        self.last_state_block_idx[request_id] = prev_state_idx
++
++        if preserve_previous_state:
++            if prev_block_len < current_state_idx:
++                req_blocks.extend(
++                    [self._null_block for _ in range(prev_block_len, current_state_idx)]
++                )
++            new_block = self.block_pool.get_new_blocks(1)[0]
++            req_blocks.append(new_block)
++        else:
++            assert not prev_state_block.is_null
++            req_blocks[prev_state_idx] = self._null_block
++            if prev_block_len < current_state_idx:
++                req_blocks.extend(
++                    [self._null_block for _ in range(prev_block_len, current_state_idx)]
++                )
++            assert len(req_blocks) == current_state_idx
++            req_blocks.append(prev_state_block)
++
++        self.current_state_block_idx[request_id] = current_state_idx
++        self._allocated_block_reqs.add(request_id)
++        return req_blocks[prev_block_len:]
++
+     def allocate_new_blocks(
          self, request_id: str, num_tokens: int, num_tokens_main_model: int
      ) -> list[KVCacheBlock]:
          assert isinstance(self.kv_cache_spec, MambaSpec)
@@ -1359,7 +1682,25 @@ index fa5395685..4f8ac0b86 100644
              # Allocate extra `num_speculative_blocks` blocks for
              # speculative decoding (MTP/EAGLE) with linear attention.
              if self.num_speculative_blocks > 0:
-@@ -1009,7 +1034,7 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -949,6 +1193,10 @@ class MambaManager(SingleTypeKVCacheManager):
+             # We can ignore lookahead tokens because current draft models don't have
+             # mamba layers.
+             num_tokens = num_tokens_main_model
++            if self._use_latest_block_reuse():
++                return self._allocate_latest_reused_blocks(
++                    request_id, num_tokens_main_model
++                )
+             req_blocks: list[KVCacheBlock] = self.req_to_blocks[request_id]
+             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
+             # num_tokens can include draft tokens that will later be rejected.
+@@ -1005,13 +1253,20 @@ class MambaManager(SingleTypeKVCacheManager):
+                     assert num_new_blocks <= self.num_speculative_blocks + 1
+                 new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+                 req_blocks.extend(new_blocks)
++                self.current_state_block_idx[request_id] = (
++                    num_required_blocks - 1 - self.num_speculative_blocks
++                )
+                 self._allocated_block_reqs.add(request_id)
                  return req_blocks[prev_block_len:]
  
      def free(self, request_id: str) -> None:
@@ -1367,8 +1708,66 @@ index fa5395685..4f8ac0b86 100644
 +        if self.mamba_cache_mode in ("align", "latest"):
              self._allocated_block_reqs.discard(request_id)
              self.last_state_block_idx.pop(request_id, None)
++            self.current_state_block_idx.pop(request_id, None)
++        if self.mamba_cache_mode == "latest":
++            self.latest_checkpoint_block_idx.pop(request_id, None)
++            self.coarse_checkpoint_block_idx.pop(request_id, None)
          super().free(request_id)
-@@ -1097,6 +1122,7 @@ class SinkFullAttentionManager(FullAttentionManager):
+ 
+     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
+@@ -1023,6 +1278,15 @@ class MambaManager(SingleTypeKVCacheManager):
+         return num_computed_tokens - 1
+ 
+     def cache_blocks(self, request: Request, num_tokens: int) -> None:
++        if self.mamba_cache_mode == "latest":
++            num_full_blocks = num_tokens // self.block_size
++            self.num_cached_block[request.request_id] = max(
++                self.num_cached_block.get(request.request_id, 0), num_full_blocks
++            )
++            if num_full_blocks > 0:
++                self._queue_latest_checkpoint(request, num_full_blocks - 1)
++            return
++
+         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
+         super().cache_blocks(request, num_tokens)
+         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
+@@ -1035,6 +1299,35 @@ class MambaManager(SingleTypeKVCacheManager):
+                 assert block.block_hash is not None
+                 self.cached_blocks_this_step.add(block.block_hash)
+ 
++    def finalize_request_cache(self, request: Request) -> None:
++        if self.mamba_cache_mode != "latest":
++            return
++
++        request_id = request.request_id
++        blocks = self.req_to_blocks.get(request_id)
++        if not blocks:
++            return
++
++        cache_block_indices = [self.latest_checkpoint_block_idx.get(request_id)]
++        cache_block_indices.append(self._latest_coarse_checkpoint_cacheable(request))
++        for block_idx in dict.fromkeys(
++            idx for idx in cache_block_indices if idx is not None
++        ):
++            if block_idx < 0 or block_idx >= len(blocks):
++                continue
++            block = blocks[block_idx]
++            if block.is_null or block.block_hash is not None:
++                continue
++            self.block_pool.cache_full_blocks(
++                request=request,
++                blocks=blocks,
++                num_cached_blocks=block_idx,
++                num_full_blocks=block_idx + 1,
++                block_size=self.block_size,
++                kv_cache_group_id=self.kv_cache_group_id,
++            )
++            assert block.block_hash is not None
++
+     def new_step_starts(self) -> None:
+         self.cached_blocks_this_step.clear()
+ 
+@@ -1097,6 +1390,7 @@ class SinkFullAttentionManager(FullAttentionManager):
          kv_cache_group_id: int,
          dcp_world_size: int = 1,
          pcp_world_size: int = 1,
@@ -1376,7 +1775,7 @@ index fa5395685..4f8ac0b86 100644
      ):
          super().__init__(
              kv_cache_spec,
-@@ -1105,6 +1131,7 @@ class SinkFullAttentionManager(FullAttentionManager):
+@@ -1105,6 +1399,7 @@ class SinkFullAttentionManager(FullAttentionManager):
              kv_cache_group_id,
              dcp_world_size,
              pcp_world_size,
@@ -1422,22 +1821,50 @@ index 0fa59579e..cee5f2263 100644
  
          self.step_fn = (
 diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
-index 48ecf6b9d..d955f2554 100644
+index 48ecf6b9d..fed142636 100644
 --- a/vllm/v1/kv_cache_interface.py
 +++ b/vllm/v1/kv_cache_interface.py
-@@ -294,7 +294,7 @@ class MambaSpec(KVCacheSpec):
-         if vllm_config.cache_config.mamba_cache_mode == "all":
-             max_model_len = vllm_config.model_config.max_model_len
+@@ -278,6 +278,9 @@ class MambaSpec(KVCacheSpec):
+     mamba_type: str = "mamba2"
+     mamba_cache_mode: str = "none"
+     num_speculative_blocks: int = 0
++    mamba_latest_coarse_block_size: int | None = None
++    mamba_latest_coarse_checkpoints: int = 0
++    mamba_latest_coarse_min_gap: int = 0
+ 
+     @property
+     def page_size_bytes(self) -> int:
+@@ -296,6 +299,17 @@ class MambaSpec(KVCacheSpec):
              return cdiv(max_model_len, self.block_size) * self.page_size_bytes
--        elif vllm_config.cache_config.mamba_cache_mode == "align":
-+        elif vllm_config.cache_config.mamba_cache_mode in ("align", "latest"):
+         elif vllm_config.cache_config.mamba_cache_mode == "align":
              return self.page_size_bytes * (2 + self.num_speculative_blocks)
++        elif vllm_config.cache_config.mamba_cache_mode == "latest":
++            num_checkpoint_blocks = 1
++            if (
++                self.mamba_latest_coarse_block_size is not None
++                and self.mamba_latest_coarse_checkpoints > 0
++            ):
++                num_checkpoint_blocks += 1
++            return (
++                self.page_size_bytes
++                * (1 + num_checkpoint_blocks + self.num_speculative_blocks)
++            )
          else:
              return self.page_size_bytes * (1 + self.num_speculative_blocks)
+ 
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 2e62206da..b51abb3dd 100644
+index 2e62206da..f2a050698 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -854,7 +854,7 @@ class GPUModelRunner(
+         # Ephemeral state transferred between execute_model() and sample_tokens().
+         self.execute_model_state: ExecuteModelState | None = None
+         self.kv_connector_output: KVConnectorOutput | None = None
+-        self.mamba_state_idx: dict[str, int] = {}
++        self.mamba_state_idx: dict[str, mamba_utils.MambaStateIndex] = {}
+         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
+         self.layerwise_nvtx_hooks_registered = False
+ 
 @@ -1041,6 +1041,62 @@ class GPUModelRunner(
          if hasattr(self, "_kv_block_zeroer"):
              self._kv_block_zeroer.zero_block_ids(block_ids)
@@ -1527,3 +1954,101 @@ index 2e62206da..b51abb3dd 100644
                  # preprocess_mamba reads req_state.num_computed_tokens (CPU)
                  # to decide copy operations, so we must apply deferred
                  # corrections before it runs.
+diff --git a/vllm/v1/worker/mamba_utils.py b/vllm/v1/worker/mamba_utils.py
+index c832389b1..8d91ee696 100644
+--- a/vllm/v1/worker/mamba_utils.py
++++ b/vllm/v1/worker/mamba_utils.py
+@@ -19,6 +19,8 @@ from vllm.v1.utils import CpuGpuBuffer
+ from vllm.v1.worker.gpu_input_batch import CachedRequestState
+ from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
+ 
++MambaStateIndex = tuple[int, tuple[int, ...]]
++
+ 
+ @triton.jit
+ def batch_memcpy_kernel(src_ptrs, dst_ptrs, sizes, BLOCK_SIZE: tl.constexpr):
+@@ -107,6 +109,15 @@ def collect_mamba_copy_meta(
+ ) -> None:
+     if src_block_idx == dest_block_idx and accept_token_bias == 0:
+         return
++    if src_block_idx >= 0 and accept_token_bias == 0:
++        same_physical_blocks = True
++        for mamba_group_id in mamba_group_ids:
++            block_ids = req_state.block_ids[mamba_group_id]
++            if block_ids[src_block_idx] != block_ids[dest_block_idx]:
++                same_physical_blocks = False
++                break
++        if same_physical_blocks:
++            return
+ 
+     src_ptrs_np = copy_bufs.src_ptrs.np
+     dst_ptrs_np = copy_bufs.dst_ptrs.np
+@@ -148,7 +159,7 @@ def preprocess_mamba(
+     scheduler_output: SchedulerOutput,
+     kv_cache_config: KVCacheConfig,
+     cache_config: CacheConfig,
+-    mamba_state_idx: dict[str, int],
++    mamba_state_idx: dict[str, MambaStateIndex],
+     input_batch: GPUInputBatch,
+     requests: dict[str, CachedRequestState],
+     forward_context: dict[str, Any],
+@@ -179,11 +190,20 @@ def preprocess_mamba(
+     copy_bufs.offset = 0
+     for i, req_id in enumerate(input_batch.req_ids):
+         req_state = requests[req_id]
+-        prev_state_idx = mamba_state_idx.get(req_id)
+-        if prev_state_idx is None:
++        prev_state = mamba_state_idx.get(req_id)
++        if prev_state is None:
+             # new / resumed request, no previous state
+             # if num_computed_tokens is 0, prev_state_idx will be -1
+             prev_state_idx = (req_state.num_computed_tokens - 1) // block_size
++            if prev_state_idx >= 0:
++                prev_state_block_ids = tuple(
++                    req_state.block_ids[mamba_group_id][prev_state_idx]
++                    for mamba_group_id in mamba_group_ids
++                )
++            else:
++                prev_state_block_ids = ()
++        else:
++            prev_state_idx, prev_state_block_ids = prev_state
+ 
+         num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+         num_blocks: int = (
+@@ -202,8 +222,16 @@ def preprocess_mamba(
+         # Block 3: speculative block
+         # And use block 1 to save the running state.
+         curr_state_idx = num_blocks - 1 - num_speculative_blocks
+-        mamba_state_idx[req_id] = curr_state_idx
+-        if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
++        curr_state_block_ids = tuple(
++            req_state.block_ids[mamba_group_id][curr_state_idx]
++            for mamba_group_id in mamba_group_ids
++        )
++        mamba_state_idx[req_id] = (curr_state_idx, curr_state_block_ids)
++        if (
++            prev_state_idx != -1
++            and prev_state_idx != curr_state_idx
++            and prev_state_block_ids != curr_state_block_ids
++        ):
+             collect_mamba_copy_meta(
+                 copy_bufs,
+                 kv_cache_config,
+@@ -224,7 +252,7 @@ def postprocess_mamba(
+     kv_cache_config: KVCacheConfig,
+     input_batch: GPUInputBatch,
+     requests: dict[str, CachedRequestState],
+-    mamba_state_idx: dict[str, int],
++    mamba_state_idx: dict[str, MambaStateIndex],
+     forward_context: dict[str, Any],
+     mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
+     copy_bufs: MambaCopyBuffers,
+@@ -255,7 +283,7 @@ def postprocess_mamba(
+         # TODO: how to ensure all blocks that cache_blocks called are cached here?
+         if aligned_new_computed_tokens >= num_tokens_running_state:
+             accept_token_bias = aligned_new_computed_tokens - num_tokens_running_state
+-            src_block_idx = mamba_state_idx[req_id]
++            src_block_idx = mamba_state_idx[req_id][0]
+             dest_block_idx = aligned_new_computed_tokens // mamba_spec.block_size - 1
+             collect_mamba_copy_meta(
+                 copy_bufs,

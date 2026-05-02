@@ -111,8 +111,10 @@ section "ruff patched files"
 section "pytest targeted latest-Mamba/MTP coverage"
 cd "$TEST_ROOT"
 "$VENV/bin/python" -m pytest \
+  tests/v1/core/test_prefix_caching.py::test_hybrid_latest_mamba_queues_bounded_checkpoints_until_free \
   tests/v1/core/test_prefix_caching.py::test_hybrid_latest_partial_full_attention_hit \
-  tests/v1/core/test_prefix_caching.py::test_hybrid_latest_partial_full_attention_prior_boundary_hit \
+  tests/v1/core/test_prefix_caching.py::test_hybrid_latest_partial_full_attention_only_current_boundary_cached \
+  tests/v1/core/test_prefix_caching.py::test_hybrid_latest_partial_full_attention_explicit_prior_boundary_hit \
   tests/v1/core/test_prefix_caching.py::test_hybrid_latest_partial_cache_eviction \
   tests/v1/core/test_scheduler.py::test_mtp_speculative_config_keeps_eagle_cache_behaviors_disabled \
   tests/v1/core/test_scheduler.py::test_hybrid_latest_mtp_does_not_reserve_eagle_lookahead_tokens \
@@ -122,6 +124,8 @@ cd "$TEST_ROOT"
   tests/v1/core/test_scheduler.py::test_hybrid_latest_tail_checkpoint_stride_split_positions \
   tests/v1/core/test_scheduler.py::test_hybrid_latest_coarse_checkpoint_selection \
   tests/v1/core/test_scheduler.py::test_hybrid_latest_tail_checkpoint_split_policy_async_scheduler \
+  tests/v1/core/test_scheduler.py::test_hybrid_latest_caches_completed_decode_tokens_for_next_turn \
+  tests/v1/worker/test_mamba_utils.py::test_resumed_req_ids_cleared_from_mamba_state_idx \
   -q
 
 echo "RESULT: PASS"

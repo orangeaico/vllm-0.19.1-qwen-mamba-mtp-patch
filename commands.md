@@ -31,6 +31,13 @@ docker run -d \
 Clone this artifact repo inside the container and run all patch tests:
 
 ```bash
+docker exec "$CONTAINER" bash -lc '
+command -v git >/dev/null 2>&1 || {
+  apt-get update &&
+  DEBIAN_FRONTEND=noninteractive apt-get install -y git
+}
+'
+
 docker exec "$CONTAINER" bash -lc "
 rm -rf /workspace/patch &&
 git clone '$PATCH_REPO' /workspace/patch &&
@@ -137,6 +144,7 @@ PYTHONPYCACHEPREFIX=/tmp/vllm-pycache /tmp/vllm-test-venv/bin/python -m py_compi
   /usr/local/lib/python3.12/dist-packages/vllm/config/speculative.py \
   /usr/local/lib/python3.12/dist-packages/vllm/config/vllm.py \
   /usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py \
+  /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/mamba/abstract.py \
   /usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/config.py \
   /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/utils.py \
   /usr/local/lib/python3.12/dist-packages/vllm/v1/core/block_pool.py \
@@ -149,13 +157,17 @@ PYTHONPYCACHEPREFIX=/tmp/vllm-pycache /tmp/vllm-test-venv/bin/python -m py_compi
   /usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core.py \
   /usr/local/lib/python3.12/dist-packages/vllm/v1/kv_cache_interface.py \
   /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_model_runner.py \
+  /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/mamba_utils.py \
   tests/v1/core/test_prefix_caching.py \
-  tests/v1/core/test_scheduler.py
+  tests/v1/core/test_scheduler.py \
+  tests/v1/e2e/general/test_mamba_prefix_cache.py \
+  tests/v1/worker/test_mamba_utils.py
 /tmp/vllm-test-venv/bin/python -m ruff check \
   /usr/local/lib/python3.12/dist-packages/vllm/config/cache.py \
   /usr/local/lib/python3.12/dist-packages/vllm/config/speculative.py \
   /usr/local/lib/python3.12/dist-packages/vllm/config/vllm.py \
   /usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py \
+  /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/mamba/abstract.py \
   /usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/config.py \
   /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/utils.py \
   /usr/local/lib/python3.12/dist-packages/vllm/v1/core/block_pool.py \
@@ -168,11 +180,16 @@ PYTHONPYCACHEPREFIX=/tmp/vllm-pycache /tmp/vllm-test-venv/bin/python -m py_compi
   /usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core.py \
   /usr/local/lib/python3.12/dist-packages/vllm/v1/kv_cache_interface.py \
   /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_model_runner.py \
+  /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/mamba_utils.py \
   tests/v1/core/test_prefix_caching.py \
-  tests/v1/core/test_scheduler.py
+  tests/v1/core/test_scheduler.py \
+  tests/v1/e2e/general/test_mamba_prefix_cache.py \
+  tests/v1/worker/test_mamba_utils.py
 /tmp/vllm-test-venv/bin/python -m pytest \
+  tests/v1/core/test_prefix_caching.py::test_hybrid_latest_mamba_queues_bounded_checkpoints_until_free \
   tests/v1/core/test_prefix_caching.py::test_hybrid_latest_partial_full_attention_hit \
-  tests/v1/core/test_prefix_caching.py::test_hybrid_latest_partial_full_attention_prior_boundary_hit \
+  tests/v1/core/test_prefix_caching.py::test_hybrid_latest_partial_full_attention_only_current_boundary_cached \
+  tests/v1/core/test_prefix_caching.py::test_hybrid_latest_partial_full_attention_explicit_prior_boundary_hit \
   tests/v1/core/test_prefix_caching.py::test_hybrid_latest_partial_cache_eviction \
   tests/v1/core/test_scheduler.py::test_mtp_speculative_config_keeps_eagle_cache_behaviors_disabled \
   tests/v1/core/test_scheduler.py::test_hybrid_latest_mtp_does_not_reserve_eagle_lookahead_tokens \
@@ -182,6 +199,8 @@ PYTHONPYCACHEPREFIX=/tmp/vllm-pycache /tmp/vllm-test-venv/bin/python -m py_compi
   tests/v1/core/test_scheduler.py::test_hybrid_latest_tail_checkpoint_stride_split_positions \
   tests/v1/core/test_scheduler.py::test_hybrid_latest_coarse_checkpoint_selection \
   tests/v1/core/test_scheduler.py::test_hybrid_latest_tail_checkpoint_split_policy_async_scheduler \
+  tests/v1/core/test_scheduler.py::test_hybrid_latest_caches_completed_decode_tokens_for_next_turn \
+  tests/v1/worker/test_mamba_utils.py::test_resumed_req_ids_cleared_from_mamba_state_idx \
   -q
 '
 ```

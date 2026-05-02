@@ -1,8 +1,8 @@
 diff --git a/tests/v1/core/test_prefix_caching.py b/tests/v1/core/test_prefix_caching.py
-index b8b387fff..48f81237a 100644
+index b8b387fff..592a1b0bb 100644
 --- a/tests/v1/core/test_prefix_caching.py
 +++ b/tests/v1/core/test_prefix_caching.py
-@@ -764,6 +764,37 @@ def _make_hybrid_kv_cache_config(
+@@ -764,6 +764,39 @@ def _make_hybrid_kv_cache_config(
      )
  
  
@@ -31,6 +31,8 @@ index b8b387fff..48f81237a 100644
 +                    shapes=(1, 1),
 +                    dtypes=(torch.float32,),
 +                    mamba_cache_mode="latest",
++                    mamba_latest_coarse_block_size=attn_block_size,
++                    mamba_latest_coarse_checkpoints=1,
 +                ),
 +            ),
 +        ],
@@ -40,7 +42,7 @@ index b8b387fff..48f81237a 100644
  # Test cases covering various combinations of KV cache spec types:
  # - Varying number of groups (2, 3, or 4)
  # - 0, 1, or 2 full attention groups
-@@ -1008,6 +1039,137 @@ def test_prefill_hybrid_model_mamba_align():
+@@ -1008,6 +1041,231 @@ def test_prefill_hybrid_model_mamba_align():
      manager.free(req0)
  
  
@@ -102,7 +104,7 @@ index b8b387fff..48f81237a 100644
 +    assert source_block.ref_cnt == 0
 +
 +
-+def test_hybrid_latest_partial_full_attention_prior_boundary_hit():
++def test_hybrid_latest_partial_full_attention_only_current_boundary_cached():
 +    hash_block_size = 16
 +    manager = KVCacheManager(
 +        _make_hybrid_latest_kv_cache_config(
@@ -127,9 +129,43 @@ index b8b387fff..48f81237a 100644
 +    assert manager.block_pool.cached_partial_block_hash_to_block[
 +        latest_key
 +    ].valid_tokens == 48
++    assert prior_key not in manager.block_pool.cached_partial_block_hash_to_block
++
++    manager.free(req0)
++
++
++def test_hybrid_latest_partial_full_attention_explicit_prior_boundary_hit():
++    hash_block_size = 16
++    manager = KVCacheManager(
++        _make_hybrid_latest_kv_cache_config(
++            attn_block_size=64,
++            mamba_block_size=hash_block_size,
++            num_blocks=20,
++        ),
++        max_model_len=8192,
++        enable_caching=True,
++        hash_block_size=hash_block_size,
++        enable_partial_attn_cache=True,
++    )
++
++    req0 = make_request("0", list(range(50)), hash_block_size, sha256)
++    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req0)
++    assert num_computed_tokens == 0
++    blocks0 = manager.allocate_slots(req0, 32, 0, computed_blocks)
++    assert blocks0 is not None
++
++    req0.num_computed_tokens = 32
++    blocks1 = manager.allocate_slots(req0, 16)
++    assert blocks1 is not None
++
++    latest_key = make_block_hash_with_group_id(req0.block_hashes[2], 0)
++    prior_key = make_block_hash_with_group_id(req0.block_hashes[1], 0)
 +    assert manager.block_pool.cached_partial_block_hash_to_block[
 +        prior_key
 +    ].valid_tokens == 32
++    assert manager.block_pool.cached_partial_block_hash_to_block[
++        latest_key
++    ].valid_tokens == 48
 +
 +    manager.new_step_starts()
 +    manager.free(req0)
@@ -143,6 +179,66 @@ index b8b387fff..48f81237a 100644
 +    assert partial_blocks[0].block.block_id == blocks0.blocks[0][0].block_id
 +
 +    manager.free(req1)
++
++
++def test_hybrid_latest_mamba_queues_bounded_checkpoints_until_free():
++    hash_block_size = 16
++    manager = KVCacheManager(
++        _make_hybrid_latest_kv_cache_config(
++            attn_block_size=64,
++            mamba_block_size=hash_block_size,
++            num_blocks=40,
++        ),
++        max_model_len=8192,
++        enable_caching=True,
++        hash_block_size=hash_block_size,
++        enable_partial_attn_cache=True,
++    )
++    mamba_manager = manager.coordinator.single_type_managers[1]
++
++    req = make_request("0", list(range(160)), hash_block_size, sha256)
++    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req)
++    assert num_computed_tokens == 0
++
++    def allocate(num_tokens: int, blocks=manager.empty_kv_cache_blocks):
++        allocated = manager.allocate_slots(
++            req,
++            num_tokens,
++            0,
++            blocks,
++        )
++        assert allocated is not None
++        req.num_computed_tokens += num_tokens
++        manager.new_step_starts()
++
++    allocate(64, computed_blocks)
++    allocate(64)
++    allocate(16)
++    allocate(16)
++
++    mamba_blocks = mamba_manager.req_to_blocks[req.request_id]
++    non_null_mamba_indices = [
++        idx for idx, block in enumerate(mamba_blocks) if not block.is_null
++    ]
++    assert len(non_null_mamba_indices) <= 2
++
++    latest_key = make_block_hash_with_group_id(req.block_hashes[9], 1)
++    coarse_key = make_block_hash_with_group_id(req.block_hashes[7], 1)
++    assert manager.block_pool.cached_block_hash_to_block.get_one_block(
++        latest_key
++    ) is None
++    assert manager.block_pool.cached_block_hash_to_block.get_one_block(
++        coarse_key
++    ) is None
++
++    manager.free(req)
++
++    assert manager.block_pool.cached_block_hash_to_block.get_one_block(
++        latest_key
++    ) is not None
++    assert manager.block_pool.cached_block_hash_to_block.get_one_block(
++        coarse_key
++    ) is not None
 +
 +
 +def test_hybrid_latest_partial_cache_eviction():
@@ -179,7 +275,7 @@ index b8b387fff..48f81237a 100644
      """Test prefill with APC and some prompt logprobs (plp) requests.
  
 diff --git a/tests/v1/core/test_scheduler.py b/tests/v1/core/test_scheduler.py
-index e4b77f24b..913e36e0f 100644
+index e4b77f24b..e12898333 100644
 --- a/tests/v1/core/test_scheduler.py
 +++ b/tests/v1/core/test_scheduler.py
 @@ -24,16 +24,19 @@ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
@@ -202,7 +298,7 @@ index e4b77f24b..913e36e0f 100644
  
  from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
  
-@@ -1661,6 +1664,443 @@ def make_output(scheduler: Scheduler):
+@@ -1661,6 +1664,442 @@ def make_output(scheduler: Scheduler):
      )
  
  
@@ -295,6 +391,9 @@ index e4b77f24b..913e36e0f 100644
 +                    shapes=(1, 1),
 +                    dtypes=(torch.float32,),
 +                    mamba_cache_mode="latest",
++                    mamba_latest_coarse_block_size=attn_block_size,
++                    mamba_latest_coarse_checkpoints=coarse_checkpoints,
++                    mamba_latest_coarse_min_gap=coarse_min_gap,
 +                ),
 +            ),
 +        ],
@@ -404,13 +503,9 @@ index e4b77f24b..913e36e0f 100644
 +    scheduler.add_request(req2)
 +    output = scheduler.schedule()
 +
-+    assert req2.num_cached_tokens == 992
-+    assert output.num_scheduled_tokens[req2.request_id] == 8
-+    assert output.kv_cache_block_copy_ops is not None
-+    assert len(output.kv_cache_block_copy_ops) == 1
-+    copy_op = output.kv_cache_block_copy_ops[0]
-+    assert copy_op.kv_cache_group_id == 0
-+    assert copy_op.num_tokens == 32
++    assert req2.num_cached_tokens == 960
++    assert output.num_scheduled_tokens[req2.request_id] == 16
++    assert output.kv_cache_block_copy_ops is None
 +    scheduler.finish_requests(req2.request_id, RequestStatus.FINISHED_STOPPED)
 +
 +    scheduler.add_request(req1)
@@ -434,8 +529,8 @@ index e4b77f24b..913e36e0f 100644
 +    ),
 +    [
 +        (0, 1, 960, 32),
-+        (1, 2, 976, 16),
-+        (2, 1, 992, 8),
++        (1, 2, 960, 32),
++        (2, 1, 960, 16),
 +    ],
 +)
 +def test_hybrid_latest_tail_checkpoint_policy_controls_cached_prefix(
@@ -646,3 +741,50 @@ index e4b77f24b..913e36e0f 100644
  def assert_scheduler_empty(scheduler: Scheduler):
      """Confirm the scheduler is "empty" - i.e. no leaks."""
      # Scheduler Metadata.
+diff --git a/tests/v1/e2e/general/test_mamba_prefix_cache.py b/tests/v1/e2e/general/test_mamba_prefix_cache.py
+index 747c5defe..deb50b768 100644
+--- a/tests/v1/e2e/general/test_mamba_prefix_cache.py
++++ b/tests/v1/e2e/general/test_mamba_prefix_cache.py
+@@ -320,7 +320,7 @@ def get_fake_process_mamba_fn(
+         scheduler_output: SchedulerOutput,
+         kv_cache_config: KVCacheConfig,
+         cache_config: CacheConfig,
+-        mamba_state_idx: dict[str, int],
++        mamba_state_idx: dict[str, mamba_utils.MambaStateIndex],
+         input_batch: GPUInputBatch,
+         requests: dict[str, CachedRequestState],
+         forward_context: dict[str, Any],
+@@ -354,7 +354,7 @@ def get_fake_process_mamba_fn(
+         kv_cache_config: KVCacheConfig,
+         input_batch: GPUInputBatch,
+         requests: dict[str, CachedRequestState],
+-        mamba_state_idx: dict[str, int],
++        mamba_state_idx: dict[str, mamba_utils.MambaStateIndex],
+         forward_context: dict[str, Any],
+         mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
+         copy_bufs: mamba_utils.MambaCopyBuffers,
+diff --git a/tests/v1/worker/test_mamba_utils.py b/tests/v1/worker/test_mamba_utils.py
+index c5d066147..ebb03c85a 100644
+--- a/tests/v1/worker/test_mamba_utils.py
++++ b/tests/v1/worker/test_mamba_utils.py
+@@ -39,10 +39,10 @@ def test_resumed_req_ids_cleared_from_mamba_state_idx():
+     copy_bufs = MagicMock(mamba_group_ids=[0], mamba_spec=spec)
+ 
+     mamba_state_idx = {
+-        "finished": 1,
+-        "preempted": 2,
+-        "resumed": 3,  # only in resumed_req_ids, NOT in preempted
+-        "keep": 99,
++        "finished": (1, (11,)),
++        "preempted": (2, (12,)),
++        "resumed": (3, (13,)),  # only in resumed_req_ids, NOT in preempted
++        "keep": (99, (199,)),
+     }
+     sched = _make_scheduler_output(
+         finished_req_ids={"finished"},
+@@ -66,4 +66,4 @@ def test_resumed_req_ids_cleared_from_mamba_state_idx():
+             copy_bufs,
+         )
+ 
+-    assert mamba_state_idx == {"keep": 99}
++    assert mamba_state_idx == {"keep": (99, (199,))}
