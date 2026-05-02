@@ -13,7 +13,7 @@ Required arguments:
   --preserve-thinking VALUE    VALUE must be true or false.
 
 Modes:
-  base   Serve the unpatched v0.19.1 image baseline with --mamba-cache-mode align.
+  base   Serve the unpatched v0.19.1 image baseline.
   mamba  Apply gold.patch into site-packages, then serve latest-Mamba.
   mtp    Apply gold.patch into site-packages, then serve latest-Mamba + MTP.
 
@@ -21,7 +21,7 @@ Run inside a vllm/vllm-openai:v0.19.1 container after cloning this artifact repo
 Use a fresh container for a true base run; this script does not undo patches.
 
 Common environment overrides:
-  MODEL_PATH, SERVED_MODEL_NAME, HOST, PORT, TP, GPU_MEMORY_UTILIZATION
+  MODEL_PATH, SERVED_MODEL_NAME, HOST, PORT, GPU_MEMORY_UTILIZATION
   MAX_MODEL_LEN, MAX_NUM_BATCHED_TOKENS, TAIL_CHECKPOINTS, COARSE_MIN_GAP
   NUM_SPECULATIVE_TOKENS, CHAT_TEMPLATE
 
@@ -96,17 +96,14 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 GOLD_PATCH="${GOLD_PATCH:-${REPO_ROOT}/gold.patch}"
 PATCH_MARKER="${PATCH_MARKER:-/tmp/vllm-qwen35-gold-installed}"
 
-MODEL_PATH="${MODEL_PATH:-/home/shared/megatron_dir/hf_models/Qwen3.5-35B-A3B-FP8/}"
+MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.6-35B-A3B-FP8}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-3003}"
-TP="${TP:-2}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}"
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-32768}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
 TAIL_CHECKPOINTS="${TAIL_CHECKPOINTS:-0}"
-TAIL_CHECKPOINT_STRIDE="${TAIL_CHECKPOINT_STRIDE:-1}"
-COARSE_CHECKPOINTS="${COARSE_CHECKPOINTS:-1}"
 COARSE_MIN_GAP="${COARSE_MIN_GAP:-512}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-3}"
 CHAT_TEMPLATE_KWARGS="{\"enable_thinking\": false, \"preserve_thinking\": ${PRESERVE_THINKING}}"
@@ -156,8 +153,6 @@ COMMON_ARGS=(
   --host "$HOST"
   --port "$PORT"
   --served-model-name "$SERVED_MODEL_NAME"
-  --tensor-parallel-size "$TP"
-  --enable-expert-parallel
   --max-model-len "$MAX_MODEL_LEN"
   --kv-cache-dtype fp8
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
@@ -187,15 +182,13 @@ case "$MODE" in
       echo "Use a fresh container for base, or set ALLOW_PATCHED_BASE=1." >&2
       exit 1
     fi
-    MODE_ARGS=(--mamba-cache-mode align)
+    MODE_ARGS=()
     ;;
   mamba)
     install_gold_patch
     MODE_ARGS=(
       --mamba-cache-mode latest
       --mamba-latest-tail-checkpoints "$TAIL_CHECKPOINTS"
-      --mamba-latest-tail-checkpoint-stride "$TAIL_CHECKPOINT_STRIDE"
-      --mamba-latest-coarse-checkpoints "$COARSE_CHECKPOINTS"
       --mamba-latest-coarse-min-gap "$COARSE_MIN_GAP"
     )
     ;;
@@ -204,8 +197,6 @@ case "$MODE" in
     MODE_ARGS=(
       --mamba-cache-mode latest
       --mamba-latest-tail-checkpoints "$TAIL_CHECKPOINTS"
-      --mamba-latest-tail-checkpoint-stride "$TAIL_CHECKPOINT_STRIDE"
-      --mamba-latest-coarse-checkpoints "$COARSE_CHECKPOINTS"
       --mamba-latest-coarse-min-gap "$COARSE_MIN_GAP"
       --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${NUM_SPECULATIVE_TOKENS}}"
     )

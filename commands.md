@@ -41,7 +41,7 @@ bash /workspace/patch/scripts/run_tests.sh
 Serve from a clean container after cloning this artifact repo:
 
 ```bash
-# base: unpatched v0.19.1 baseline with --mamba-cache-mode align
+# base: unpatched v0.19.1 baseline
 docker exec "$CONTAINER" bash -lc '
 cd /workspace/patch &&
 bash scripts/serve.sh base --preserve-thinking true
@@ -191,15 +191,25 @@ PYTHONPYCACHEPREFIX=/tmp/vllm-pycache /tmp/vllm-test-venv/bin/python -m py_compi
 ```bash
 docker exec "$CONTAINER" bash -lc '
 cd /tmp
-vllm serve /home/shared/megatron_dir/hf_models/Qwen3.5-35B-A3B-FP8/ \
+vllm serve Qwen/Qwen3.6-35B-A3B-FP8 \
+  --host 0.0.0.0 \
+  --port 3003 \
   --served-model-name qwen3 \
-  --tensor-parallel-size 2 \
-  --enable-expert-parallel \
   --max-model-len 65536 \
   --kv-cache-dtype fp8 \
-  --gpu-memory-utilization 0.86 \
+  --gpu-memory-utilization 0.95 \
   --enable-prefix-caching \
   --language-model-only \
+  --default-chat-template-kwargs '"'"'{"enable_thinking": false, "preserve_thinking": true}'"'"' \
+  --reasoning-parser qwen3 \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder \
+  --trust-remote-code \
+  --max-num-batched-tokens 32768 \
+  --performance-mode throughput \
+  --async-scheduling \
+  --mamba-ssm-cache-dtype float16 \
+  --no-scheduler-reserve-full-isl \
   --mamba-cache-mode latest \
   --mamba-latest-tail-checkpoints 0 \
   --mamba-latest-coarse-min-gap 512 \
