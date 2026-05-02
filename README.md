@@ -7,6 +7,44 @@ Artifacts:
 - `gold.patch`: production runtime files under `vllm/` only.
 - `test.patch`: test files under `tests/` only.
 - `commands.md`: paste-ready reproduction and serve commands.
+- `scripts/run_tests.sh`: run inside a clean vLLM serve container after
+  cloning this artifact repo; applies both patches and validates tests.
+- `scripts/serve.sh`: run inside a clean vLLM serve container after cloning
+  this artifact repo; serves `base`, patched `mamba`, or patched `mtp`.
+
+Suggested repo layout:
+
+```text
+vllm-0.19.1-qwen-mamba-mtp-patch/
+├── README.md
+├── commands.md
+├── gold.patch
+├── test.patch
+└── scripts/
+    ├── run_tests.sh
+    └── serve.sh
+```
+
+Inside a clean `vllm/vllm-openai:v0.19.1` container, clone and run tests:
+
+```bash
+git clone https://github.com/orangeaico/vllm-0.19.1-qwen-mamba-mtp-patch.git /workspace/patch
+bash /workspace/patch/scripts/run_tests.sh
+```
+
+Inside a clean `vllm/vllm-openai:v0.19.1` container, serve one mode:
+
+```bash
+git clone https://github.com/orangeaico/vllm-0.19.1-qwen-mamba-mtp-patch.git /workspace/patch
+bash /workspace/patch/scripts/serve.sh base --preserve-thinking true
+bash /workspace/patch/scripts/serve.sh mamba --preserve-thinking true
+bash /workspace/patch/scripts/serve.sh mtp --preserve-thinking true
+```
+
+Use a fresh container for `base`; `serve.sh mamba` and `serve.sh mtp` install
+`gold.patch` into the container's installed vLLM package. The
+`--preserve-thinking true|false` value is required on every serve run so
+benchmark comparisons do not accidentally mix chat-template settings.
 
 The production patch includes latest-Mamba prefix-cache support, tail and coarse
 checkpoint controls, partial full-attention cache reuse, and MTP compatibility.

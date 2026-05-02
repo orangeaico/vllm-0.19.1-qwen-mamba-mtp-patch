@@ -7,7 +7,63 @@ REPO=/home/shramana/vllm-hybrid-optim
 ARTIFACTS=$REPO/vllm_qwen35_patch_artifacts
 BASE=b1388b1fbf5aaef47937fabe98931211684666a6
 CONTAINER=vllm-qwen35-patch-test
+PATCH_REPO=https://github.com/orangeaico/vllm-0.19.1-qwen-mamba-mtp-patch.git
 ```
+
+## Simple GitHub-Based Workflow
+
+Start a clean test container:
+
+```bash
+docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+docker run -d \
+  --name "$CONTAINER" \
+  --entrypoint /bin/bash \
+  --gpus all \
+  --ipc=host \
+  --network host \
+  -v /home/shared:/home/shared \
+  -w /workspace \
+  vllm/vllm-openai:v0.19.1 \
+  -lc 'sleep infinity'
+```
+
+Clone this artifact repo inside the container and run all patch tests:
+
+```bash
+docker exec "$CONTAINER" bash -lc "
+rm -rf /workspace/patch &&
+git clone '$PATCH_REPO' /workspace/patch &&
+bash /workspace/patch/scripts/run_tests.sh
+"
+```
+
+Serve from a clean container after cloning this artifact repo:
+
+```bash
+# base: unpatched v0.19.1 baseline with --mamba-cache-mode align
+docker exec "$CONTAINER" bash -lc '
+cd /workspace/patch &&
+bash scripts/serve.sh base --preserve-thinking true
+'
+
+# mamba: patched latest-Mamba, no MTP
+docker exec "$CONTAINER" bash -lc '
+cd /workspace/patch &&
+bash scripts/serve.sh mamba --preserve-thinking true
+'
+
+# mtp: patched latest-Mamba plus MTP with 3 draft tokens
+docker exec "$CONTAINER" bash -lc '
+cd /workspace/patch &&
+bash scripts/serve.sh mtp --preserve-thinking true
+'
+```
+
+Use a fresh container for each serve mode when comparing performance. The
+`mamba` and `mtp` modes patch the installed vLLM package in-place. Pass
+`--preserve-thinking false` instead when you intentionally want that chat
+template behavior; the script refuses to run without an explicit value.
 
 ## 1. Run Container
 
