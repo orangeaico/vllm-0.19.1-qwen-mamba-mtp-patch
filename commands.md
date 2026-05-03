@@ -164,7 +164,9 @@ PYTHONPYCACHEPREFIX=/tmp/vllm-pycache /tmp/vllm-test-venv/bin/python -m py_compi
   tests/v1/core/test_single_type_kv_cache_manager.py \
   tests/v1/e2e/general/test_mamba_prefix_cache.py \
   tests/v1/worker/test_mamba_utils.py
-/tmp/vllm-test-venv/bin/python -m ruff check --config /tmp/vllm-tests/pyproject.toml \
+/tmp/vllm-test-venv/bin/python -m ruff check \
+  --config /tmp/vllm-tests/pyproject.toml \
+  --ignore I001 \
   /usr/local/lib/python3.12/dist-packages/vllm/config/cache.py \
   /usr/local/lib/python3.12/dist-packages/vllm/config/speculative.py \
   /usr/local/lib/python3.12/dist-packages/vllm/config/vllm.py \

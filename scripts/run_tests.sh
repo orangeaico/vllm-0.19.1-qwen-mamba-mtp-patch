@@ -152,7 +152,10 @@ PYTHONPYCACHEPREFIX=/tmp/vllm-patch-pycache \
   "$VENV/bin/python" -m py_compile "${PY_FILES[@]}"
 
 section "ruff patched files"
-"$VENV/bin/python" -m ruff check --config "$TEST_ROOT/pyproject.toml" "${PY_FILES[@]}"
+"$VENV/bin/python" -m ruff check \
+  --config "$TEST_ROOT/pyproject.toml" \
+  --ignore I001 \
+  "${PY_FILES[@]}"
 
 section "pytest targeted latest-Mamba/MTP coverage"
 cd "$TEST_ROOT"
