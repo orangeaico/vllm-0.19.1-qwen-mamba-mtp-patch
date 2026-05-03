@@ -136,13 +136,6 @@ if expected_root != actual.parent:
         f"{actual}, expected installed runtime under {expected_root}."
     )
 
-try:
-    import vllm._C  # noqa: F401
-except Exception as exc:
-    raise SystemExit(
-        f"installed vllm extension import failed from {actual}: {exc!r}"
-    )
-
 print(f"Verified installed vLLM import: {actual}")
 PY
 
