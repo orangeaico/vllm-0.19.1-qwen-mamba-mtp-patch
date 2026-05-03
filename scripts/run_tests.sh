@@ -18,6 +18,16 @@ section() {
   printf '\n==> %s\n' "$*"
 }
 
+cleanup_workdir() {
+  case "$WORKDIR" in
+    ""|"/"|"$REPO_ROOT"|"$SITE_PACKAGES"|"$SITE_PACKAGES"/*|"$TEST_ROOT"|"$VENV")
+      echo "Refusing unsafe WORKDIR cleanup: $WORKDIR" >&2
+      exit 1
+      ;;
+  esac
+  rm -rf "$WORKDIR"
+}
+
 need_file() {
   if [[ ! -f "$1" ]]; then
     echo "Missing required file: $1" >&2
@@ -81,6 +91,11 @@ git diff --check
 section "Copy patched tests"
 mkdir -p "$TEST_ROOT"
 cp -a tests "$TEST_ROOT/tests"
+
+section "Remove source checkout before test execution"
+cd /tmp
+cleanup_workdir
+unset PYTHONPATH
 
 section "Create test virtualenv"
 rm -rf "$VENV"

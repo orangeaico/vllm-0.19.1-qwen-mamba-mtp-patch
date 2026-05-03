@@ -95,6 +95,7 @@ SITE_PACKAGES="${SITE_PACKAGES:-/usr/local/lib/python3.12/dist-packages}"
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 GOLD_PATCH="${GOLD_PATCH:-${REPO_ROOT}/gold.patch}"
 PATCH_MARKER="${PATCH_MARKER:-/tmp/vllm-qwen35-gold-installed}"
+RUNTIME_CWD="${RUNTIME_CWD:-/tmp}"
 
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.6-35B-A3B-FP8}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3}"
@@ -109,6 +110,16 @@ NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-3}"
 CHAT_TEMPLATE_KWARGS="{\"enable_thinking\": false, \"preserve_thinking\": ${PRESERVE_THINKING}}"
 
 export VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS="${VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:-1}"
+
+cleanup_patch_workdir() {
+  case "$PATCH_WORKDIR" in
+    ""|"/"|"$REPO_ROOT"|"$SITE_PACKAGES"|"$SITE_PACKAGES"/*)
+      echo "Refusing unsafe PATCH_WORKDIR cleanup: $PATCH_WORKDIR" >&2
+      exit 1
+      ;;
+  esac
+  rm -rf "$PATCH_WORKDIR"
+}
 
 install_gold_patch() {
   if [[ -f "$PATCH_MARKER" ]]; then
@@ -134,7 +145,7 @@ install_gold_patch() {
     exit 1
   fi
 
-  rm -rf "$PATCH_WORKDIR"
+  cleanup_patch_workdir
   mkdir -p "$PATCH_WORKDIR"
   git clone --no-checkout "$VLLM_REPO_URL" "$PATCH_WORKDIR/vllm"
   cd "$PATCH_WORKDIR/vllm"
@@ -146,6 +157,16 @@ install_gold_patch() {
     install -D -m 0644 "$rel" "$SITE_PACKAGES/$rel"
   done
   date -u +"%Y-%m-%dT%H:%M:%SZ" > "$PATCH_MARKER"
+}
+
+prepare_runtime_environment() {
+  if [[ -n "${PYTHONPATH:-}" ]]; then
+    echo "Clearing PYTHONPATH to avoid source-checkout shadowing." >&2
+    unset PYTHONPATH
+  fi
+  mkdir -p "$RUNTIME_CWD"
+  cd "$RUNTIME_CWD"
+  cleanup_patch_workdir
 }
 
 COMMON_ARGS=(
@@ -204,4 +225,5 @@ case "$MODE" in
 esac
 
 echo "Serving mode: $MODE"
+prepare_runtime_environment
 exec vllm serve "${COMMON_ARGS[@]}" "${MODE_ARGS[@]}" "$@"
