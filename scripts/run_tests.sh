@@ -81,6 +81,10 @@ git apply "$GOLD_PATCH"
 section "Install patched runtime files into site-packages"
 for rel in "${RUNTIME_FILES[@]}"; do
   install -D -m 0644 "$rel" "$SITE_PACKAGES/$rel"
+  if ! cmp -s "$rel" "$SITE_PACKAGES/$rel"; then
+    echo "Installed runtime file does not match patched source: $rel" >&2
+    exit 1
+  fi
 done
 
 section "Apply test.patch"
@@ -115,6 +119,32 @@ for rel in "${TEST_FILES[@]}"; do
     PY_FILES+=("$TEST_ROOT/$rel")
   fi
 done
+
+section "Verify installed vLLM import"
+EXPECTED_SITE_PACKAGES="$SITE_PACKAGES" "$VENV/bin/python" - <<'PY'
+import os
+from pathlib import Path
+
+expected_root = Path(os.environ["EXPECTED_SITE_PACKAGES"]).resolve() / "vllm"
+
+import vllm
+
+actual = Path(vllm.__file__).resolve()
+if expected_root != actual.parent:
+    raise SystemExit(
+        "vllm import resolved to "
+        f"{actual}, expected installed runtime under {expected_root}."
+    )
+
+try:
+    import vllm._C  # noqa: F401
+except Exception as exc:
+    raise SystemExit(
+        f"installed vllm extension import failed from {actual}: {exc!r}"
+    )
+
+print(f"Verified installed vLLM import: {actual}")
+PY
 
 section "py_compile patched files"
 PYTHONPYCACHEPREFIX=/tmp/vllm-patch-pycache \
