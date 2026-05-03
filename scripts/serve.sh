@@ -24,6 +24,7 @@ Common environment overrides:
   MODEL_PATH, SERVED_MODEL_NAME, HOST, PORT, GPU_MEMORY_UTILIZATION
   MAX_MODEL_LEN, MAX_NUM_BATCHED_TOKENS, TAIL_CHECKPOINTS, COARSE_MIN_GAP
   NUM_SPECULATIVE_TOKENS, CHAT_TEMPLATE
+  PATCH_WORKDIR, SITE_PACKAGES, PYTHON_BIN, RUNTIME_CWD
 
 Preserve-thinking can be passed as --preserve-thinking true|false or as
 PRESERVE_THINKING=true|false. It is required so benchmark runs cannot
@@ -95,7 +96,20 @@ SITE_PACKAGES="${SITE_PACKAGES:-/usr/local/lib/python3.12/dist-packages}"
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 GOLD_PATCH="${GOLD_PATCH:-${REPO_ROOT}/gold.patch}"
 PATCH_MARKER="${PATCH_MARKER:-/tmp/vllm-qwen35-gold-installed}"
+PATCH_MANIFEST="${PATCH_MANIFEST:-${PATCH_MARKER}.sha256}"
+PATCH_METADATA="${PATCH_METADATA:-${PATCH_MARKER}.metadata}"
 RUNTIME_CWD="${RUNTIME_CWD:-/tmp}"
+PYTHON_BIN="${PYTHON_BIN:-}"
+if [[ -z "$PYTHON_BIN" ]]; then
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+  elif command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python)"
+  else
+    echo "Missing required command: python3 or python" >&2
+    exit 1
+  fi
+fi
 
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.6-35B-A3B-FP8}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3}"
@@ -111,27 +125,11 @@ CHAT_TEMPLATE_KWARGS="{\"enable_thinking\": false, \"preserve_thinking\": ${PRES
 
 export VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS="${VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:-1}"
 
-cleanup_patch_workdir() {
-  case "$PATCH_WORKDIR" in
-    ""|"/"|"$REPO_ROOT"|"$SITE_PACKAGES"|"$SITE_PACKAGES"/*)
-      echo "Refusing unsafe PATCH_WORKDIR cleanup: $PATCH_WORKDIR" >&2
-      exit 1
-      ;;
-  esac
-  rm -rf "$PATCH_WORKDIR"
-}
+runtime_files=()
 
-install_gold_patch() {
-  if [[ -f "$PATCH_MARKER" ]]; then
-    echo "gold.patch already installed: $PATCH_MARKER"
-    return
-  fi
+load_runtime_files() {
   if [[ ! -f "$GOLD_PATCH" ]]; then
     echo "Missing gold.patch: $GOLD_PATCH" >&2
-    exit 1
-  fi
-  if ! command -v git >/dev/null 2>&1; then
-    echo "Missing required command: git" >&2
     exit 1
   fi
 
@@ -144,19 +142,157 @@ install_gold_patch() {
     echo "gold.patch did not contain any vllm/ runtime files." >&2
     exit 1
   fi
+}
+
+write_patch_metadata() {
+  {
+    printf 'base_commit=%s\n' "$BASE_COMMIT"
+    printf 'gold_patch_sha256=%s\n' "$(sha256sum "$GOLD_PATCH" | awk '{print $1}')"
+    printf 'runtime_files_sha256=%s\n' "$(
+      printf '%s\n' "${runtime_files[@]}" | sha256sum | awk '{print $1}'
+    )"
+  } > "$PATCH_METADATA"
+}
+
+verify_patch_metadata() {
+  [[ -f "$PATCH_METADATA" ]] || {
+    echo "Patch marker exists but metadata is missing: $PATCH_METADATA" >&2
+    return 1
+  }
+
+  local expected_patch_sha expected_files_sha
+  expected_patch_sha="$(sha256sum "$GOLD_PATCH" | awk '{print $1}')"
+  expected_files_sha="$(printf '%s\n' "${runtime_files[@]}" | sha256sum | awk '{print $1}')"
+
+  grep -qx "base_commit=${BASE_COMMIT}" "$PATCH_METADATA" || {
+    echo "Installed patch base commit does not match $BASE_COMMIT" >&2
+    return 1
+  }
+  grep -qx "gold_patch_sha256=${expected_patch_sha}" "$PATCH_METADATA" || {
+    echo "Installed patch metadata does not match current gold.patch" >&2
+    return 1
+  }
+  grep -qx "runtime_files_sha256=${expected_files_sha}" "$PATCH_METADATA" || {
+    echo "Installed patch runtime file list does not match current gold.patch" >&2
+    return 1
+  }
+}
+
+cleanup_patch_workdir() {
+  case "$PATCH_WORKDIR" in
+    ""|"/"|"$REPO_ROOT"|"$SITE_PACKAGES"|"$SITE_PACKAGES"/*)
+      echo "Refusing unsafe PATCH_WORKDIR cleanup: $PATCH_WORKDIR" >&2
+      exit 1
+      ;;
+  esac
+  rm -rf "$PATCH_WORKDIR"
+}
+
+assert_installed_vllm_import() {
+  local output
+  if ! output="$(
+    PYTHONPATH= EXPECTED_SITE_PACKAGES="$SITE_PACKAGES" "$PYTHON_BIN" - <<'PY'
+import os
+from pathlib import Path
+
+expected_root = Path(os.environ["EXPECTED_SITE_PACKAGES"]).resolve() / "vllm"
+
+import vllm
+
+actual = Path(vllm.__file__).resolve()
+if expected_root != actual.parent:
+    raise SystemExit(
+        "vllm import resolved to "
+        f"{actual}, expected installed runtime under {expected_root}. "
+        "Refusing to serve from a source checkout or PYTHONPATH shadow."
+    )
+
+try:
+    import vllm._C  # noqa: F401
+except Exception as exc:
+    raise SystemExit(
+        f"installed vllm extension import failed from {actual}: {exc!r}"
+    )
+
+print(f"Verified installed vLLM import: {actual}")
+PY
+  )"; then
+    echo "$output" >&2
+    exit 1
+  fi
+  echo "$output"
+}
+
+verify_installed_patch() {
+  load_runtime_files
+  verify_patch_metadata || return 1
+
+  if [[ ! -f "$PATCH_MANIFEST" ]]; then
+    echo "Patch marker exists but manifest is missing: $PATCH_MANIFEST" >&2
+    return 1
+  fi
+
+  for rel in "${runtime_files[@]}"; do
+    if [[ ! -f "$SITE_PACKAGES/$rel" ]]; then
+      echo "Installed patched file is missing: $SITE_PACKAGES/$rel" >&2
+      return 1
+    fi
+  done
+
+  if ! sha256sum --check --quiet "$PATCH_MANIFEST"; then
+    echo "Installed patched files do not match manifest: $PATCH_MANIFEST" >&2
+    return 1
+  fi
+}
+
+install_gold_patch() {
+  load_runtime_files
+
+  if [[ -f "$PATCH_MARKER" ]]; then
+    if verify_installed_patch; then
+      echo "gold.patch already installed and verified: $PATCH_MARKER"
+      cleanup_patch_workdir
+      return
+    fi
+    echo "Existing patch marker failed verification; reinstalling gold.patch." >&2
+    rm -f "$PATCH_MARKER" "$PATCH_MANIFEST" "$PATCH_METADATA"
+  fi
+
+  if ! command -v git >/dev/null 2>&1; then
+    echo "Missing required command: git" >&2
+    exit 1
+  fi
 
   cleanup_patch_workdir
   mkdir -p "$PATCH_WORKDIR"
   git clone --no-checkout "$VLLM_REPO_URL" "$PATCH_WORKDIR/vllm"
-  cd "$PATCH_WORKDIR/vllm"
-  git checkout "$BASE_COMMIT"
-  git apply --check "$GOLD_PATCH"
-  git apply "$GOLD_PATCH"
 
-  for rel in "${runtime_files[@]}"; do
-    install -D -m 0644 "$rel" "$SITE_PACKAGES/$rel"
-  done
+  (
+    cd "$PATCH_WORKDIR/vllm"
+    git checkout "$BASE_COMMIT"
+    git apply --check "$GOLD_PATCH"
+    git apply "$GOLD_PATCH"
+
+    : > "${PATCH_MANIFEST}.tmp"
+    for rel in "${runtime_files[@]}"; do
+      if [[ ! -f "$rel" ]]; then
+        echo "Patched runtime file was not produced: $rel" >&2
+        exit 1
+      fi
+      install -D -m 0644 "$rel" "$SITE_PACKAGES/$rel"
+      if ! cmp -s "$rel" "$SITE_PACKAGES/$rel"; then
+        echo "Installed runtime file does not match patched source: $rel" >&2
+        exit 1
+      fi
+      sha256sum "$SITE_PACKAGES/$rel" >> "${PATCH_MANIFEST}.tmp"
+    done
+  )
+
+  mv "${PATCH_MANIFEST}.tmp" "$PATCH_MANIFEST"
+  write_patch_metadata
   date -u +"%Y-%m-%dT%H:%M:%SZ" > "$PATCH_MARKER"
+  cleanup_patch_workdir
+  verify_installed_patch
 }
 
 prepare_runtime_environment() {
@@ -166,7 +302,7 @@ prepare_runtime_environment() {
   fi
   mkdir -p "$RUNTIME_CWD"
   cd "$RUNTIME_CWD"
-  cleanup_patch_workdir
+  assert_installed_vllm_import
 }
 
 COMMON_ARGS=(
@@ -224,6 +360,6 @@ case "$MODE" in
     ;;
 esac
 
-echo "Serving mode: $MODE"
 prepare_runtime_environment
+echo "Serving mode: $MODE"
 exec vllm serve "${COMMON_ARGS[@]}" "${MODE_ARGS[@]}" "$@"
