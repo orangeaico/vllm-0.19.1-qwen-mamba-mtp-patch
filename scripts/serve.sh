@@ -95,6 +95,9 @@ PATCH_WORKDIR="${PATCH_WORKDIR:-/workspace/vllm-runtime-patch}"
 SITE_PACKAGES="${SITE_PACKAGES:-/usr/local/lib/python3.12/dist-packages}"
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 GOLD_PATCH="${GOLD_PATCH:-${REPO_ROOT}/gold.patch}"
+PATCH_MARKER="${PATCH_MARKER:-/tmp/vllm-qwen35-gold-installed}"
+PATCH_MANIFEST="${PATCH_MANIFEST:-${PATCH_MARKER}.sha256}"
+PATCH_METADATA="${PATCH_METADATA:-${PATCH_MARKER}.metadata}"
 RUNTIME_CWD="${RUNTIME_CWD:-/tmp}"
 PYTHON_BIN="${PYTHON_BIN:-}"
 if [[ -z "$PYTHON_BIN" ]]; then
@@ -141,6 +144,40 @@ load_runtime_files() {
   fi
 }
 
+write_patch_metadata() {
+  {
+    printf 'base_commit=%s\n' "$BASE_COMMIT"
+    printf 'gold_patch_sha256=%s\n' "$(sha256sum "$GOLD_PATCH" | awk '{print $1}')"
+    printf 'runtime_files_sha256=%s\n' "$(
+      printf '%s\n' "${runtime_files[@]}" | sha256sum | awk '{print $1}'
+    )"
+  } > "$PATCH_METADATA"
+}
+
+verify_patch_metadata() {
+  [[ -f "$PATCH_METADATA" ]] || {
+    echo "Patch marker exists but metadata is missing: $PATCH_METADATA" >&2
+    return 1
+  }
+
+  local expected_patch_sha expected_files_sha
+  expected_patch_sha="$(sha256sum "$GOLD_PATCH" | awk '{print $1}')"
+  expected_files_sha="$(printf '%s\n' "${runtime_files[@]}" | sha256sum | awk '{print $1}')"
+
+  grep -qx "base_commit=${BASE_COMMIT}" "$PATCH_METADATA" || {
+    echo "Installed patch base commit does not match $BASE_COMMIT" >&2
+    return 1
+  }
+  grep -qx "gold_patch_sha256=${expected_patch_sha}" "$PATCH_METADATA" || {
+    echo "Installed patch metadata does not match current gold.patch" >&2
+    return 1
+  }
+  grep -qx "runtime_files_sha256=${expected_files_sha}" "$PATCH_METADATA" || {
+    echo "Installed patch runtime file list does not match current gold.patch" >&2
+    return 1
+  }
+}
+
 cleanup_patch_workdir() {
   case "$PATCH_WORKDIR" in
     ""|"/"|"$REPO_ROOT"|"$SITE_PACKAGES"|"$SITE_PACKAGES"/*)
@@ -170,6 +207,13 @@ if expected_root != actual.parent:
         "Refusing to serve from a source checkout or PYTHONPATH shadow."
     )
 
+try:
+    import vllm._C  # noqa: F401
+except Exception as exc:
+    raise SystemExit(
+        f"installed vllm extension import failed from {actual}: {exc!r}"
+    )
+
 print(f"Verified installed vLLM import: {actual}")
 PY
   )"; then
@@ -179,8 +223,40 @@ PY
   echo "$output"
 }
 
+verify_installed_patch() {
+  load_runtime_files
+  verify_patch_metadata || return 1
+
+  if [[ ! -f "$PATCH_MANIFEST" ]]; then
+    echo "Patch marker exists but manifest is missing: $PATCH_MANIFEST" >&2
+    return 1
+  fi
+
+  for rel in "${runtime_files[@]}"; do
+    if [[ ! -f "$SITE_PACKAGES/$rel" ]]; then
+      echo "Installed patched file is missing: $SITE_PACKAGES/$rel" >&2
+      return 1
+    fi
+  done
+
+  if ! sha256sum --check --quiet "$PATCH_MANIFEST"; then
+    echo "Installed patched files do not match manifest: $PATCH_MANIFEST" >&2
+    return 1
+  fi
+}
+
 install_gold_patch() {
   load_runtime_files
+
+  if [[ -f "$PATCH_MARKER" ]]; then
+    if verify_installed_patch; then
+      echo "gold.patch already installed and verified: $PATCH_MARKER"
+      cleanup_patch_workdir
+      return
+    fi
+    echo "Existing patch marker failed verification; reinstalling gold.patch." >&2
+    rm -f "$PATCH_MARKER" "$PATCH_MANIFEST" "$PATCH_METADATA"
+  fi
 
   if ! command -v git >/dev/null 2>&1; then
     echo "Missing required command: git" >&2
@@ -197,6 +273,7 @@ install_gold_patch() {
     git apply --check "$GOLD_PATCH"
     git apply "$GOLD_PATCH"
 
+    : > "${PATCH_MANIFEST}.tmp"
     for rel in "${runtime_files[@]}"; do
       if [[ ! -f "$rel" ]]; then
         echo "Patched runtime file was not produced: $rel" >&2
@@ -207,10 +284,15 @@ install_gold_patch() {
         echo "Installed runtime file does not match patched source: $rel" >&2
         exit 1
       fi
+      sha256sum "$SITE_PACKAGES/$rel" >> "${PATCH_MANIFEST}.tmp"
     done
   )
 
+  mv "${PATCH_MANIFEST}.tmp" "$PATCH_MANIFEST"
+  write_patch_metadata
+  date -u +"%Y-%m-%dT%H:%M:%SZ" > "$PATCH_MARKER"
   cleanup_patch_workdir
+  verify_installed_patch
 }
 
 prepare_runtime_environment() {
@@ -252,6 +334,11 @@ fi
 MODE_ARGS=()
 case "$MODE" in
   base)
+    if [[ -f "$PATCH_MARKER" && "${ALLOW_PATCHED_BASE:-0}" != "1" ]]; then
+      echo "Patch marker exists, so this is not a clean base container: $PATCH_MARKER" >&2
+      echo "Use a fresh container for base, or set ALLOW_PATCHED_BASE=1." >&2
+      exit 1
+    fi
     MODE_ARGS=()
     ;;
   mamba)
