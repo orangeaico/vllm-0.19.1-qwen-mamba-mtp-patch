@@ -10,7 +10,7 @@ reuse and MTP speculative decoding.
 Patch summary from `git apply --stat gold.patch`:
 
 - 18 production files changed.
-- 1057 insertions, 58 deletions.
+- 1212 insertions, 68 deletions.
 - No tests, docs, benchmarks, scripts, or debug logging are in `gold.patch`.
 
 Changed production files:
@@ -352,12 +352,27 @@ both the logical state index and the physical Mamba block IDs. If the scheduler
 reused the same physical block at a later logical state slot, the worker sees
 identical physical IDs and skips the redundant state copy.
 
+The patch also preserves source Mamba state blocks until the worker has
+finished the scheduled forward. `SchedulerOutput` carries
+`mamba_source_block_refs`, the scheduler takes those refs after scheduling, and
+`update_from_output()` releases them only after the model runner returns. The
+Mamba manager counts in-flight source refs so skipped-block removal,
+checkpoint replacement, and block relocation cannot free or move a source state
+while `preprocess_mamba()` or accepted-token MTP copy work still needs it. See
+`vllm/v1/core/sched/output.py:237`,
+`vllm/v1/core/sched/scheduler.py:1062`-`1083`,
+`vllm/v1/core/sched/scheduler.py:1461`-`1462`,
+`vllm/v1/core/single_type_kv_cache_manager.py:1375`-`1405`, and
+`vllm/v1/worker/mamba_utils.py:120`-`223`.
+
 Contract:
 
 - Latest mode keeps one running state plus a bounded latest/coarse checkpoint
   set while the request is active.
 - Latest mode differs from align in scheduler/hash/checkpoint policy and in
   delayed Mamba cache finalization.
+- A Mamba source state selected for worker copy must remain alive and at the
+  same physical block ID until scheduler output processing completes.
 
 ## End-To-End Request Flow
 
@@ -535,6 +550,8 @@ When reviewing `gold.patch`, check these invariants:
 - Partial-cache metadata is not backfilled for uncommitted prior boundaries,
   so full-attention copy ops are not emitted for boundaries that latest-Mamba
   cannot use.
+- In-flight Mamba source state refs protect worker copy sources through async
+  scheduling completion.
 - MTP still returns true for `use_eagle()`, but false for Eagle prefix-cache
   drop and KV lookahead.
 - MTP does not set scheduler `num_lookahead_tokens`.
@@ -574,3 +591,5 @@ The production contracts above are covered by `test.patch` in these areas:
 - Completed decode tokens reused by the next turn.
 - Partial full-attention hit, current-boundary-only behavior, explicit
   prior-boundary hit, and eviction cleanup.
+- Mamba source-state lifetime across skipped-block removal, checkpoint
+  replacement, repeated references, relocation, and worker copy source lookup.

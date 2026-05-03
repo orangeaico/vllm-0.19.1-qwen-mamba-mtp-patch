@@ -170,7 +170,14 @@ cd "$TEST_ROOT"
   tests/v1/core/test_scheduler.py::test_hybrid_latest_coarse_checkpoint_selection \
   tests/v1/core/test_scheduler.py::test_hybrid_latest_tail_checkpoint_split_policy_async_scheduler \
   tests/v1/core/test_scheduler.py::test_hybrid_latest_caches_completed_decode_tokens_for_next_turn \
+  tests/v1/core/test_single_type_kv_cache_manager.py::test_latest_mamba_remove_skipped_blocks_keeps_source_state \
+  tests/v1/core/test_single_type_kv_cache_manager.py::test_latest_mamba_checkpoint_replacement_keeps_source_state \
+  tests/v1/core/test_single_type_kv_cache_manager.py::test_latest_mamba_inflight_source_state_released_on_completion \
+  tests/v1/core/test_single_type_kv_cache_manager.py::test_latest_mamba_repeated_source_refs_require_matching_releases \
+  tests/v1/core/test_single_type_kv_cache_manager.py::test_latest_mamba_inflight_source_state_not_relocated \
   tests/v1/worker/test_mamba_utils.py::test_resumed_req_ids_cleared_from_mamba_state_idx \
+  tests/v1/worker/test_mamba_utils.py::test_preprocess_mamba_uses_recorded_source_block_ids \
+  tests/v1/worker/test_mamba_utils.py::test_collect_mamba_copy_meta_uses_recorded_spec_source_offset \
   -q
 
 echo "RESULT: PASS"

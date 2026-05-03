@@ -242,6 +242,18 @@ IDs in addition to the logical state index. If the scheduler reused the same
 physical Mamba state block at a later logical index, preprocess observes the
 same physical IDs and skips the copy.
 
+Async scheduling adds one more lifetime contract: a source Mamba state selected
+for worker copy cannot be freed or relocated before the worker finishes the
+scheduled forward. The scheduler places `mamba_source_block_refs` on
+`SchedulerOutput`, takes those refs after scheduling, and releases them in
+`update_from_output()` after model-runner output is available
+(`vllm/v1/core/sched/output.py:237`,
+`vllm/v1/core/sched/scheduler.py:1062`-`1083`,
+`vllm/v1/core/sched/scheduler.py:1461`-`1462`). The Mamba manager keeps
+reference counts for those source blocks so skipped-block cleanup, checkpoint
+replacement, and relocation leave them alone until release
+(`vllm/v1/core/single_type_kv_cache_manager.py:1375`-`1405`).
+
 For speculative decoding on hybrid models, worker postprocess computes accepted
 token counts and invokes Mamba postprocessing in `align/latest`
 (`vllm/v1/worker/gpu_model_runner.py:1477`-`1518`). The utility copies the
@@ -311,6 +323,11 @@ There are several separate removal paths:
 - Partial full-attention hit, current-boundary-only behavior, explicit
   prior-boundary hit, and partial eviction:
   `tests/v1/core/test_prefix_caching.py:1042`-`1195`.
+- Mamba source-state lifetime across skipped-block removal, checkpoint
+  replacement, repeated references, and relocation:
+  `tests/v1/core/test_single_type_kv_cache_manager.py:346`-`472`.
+- Worker Mamba copy source lookup uses recorded physical source block IDs:
+  `tests/v1/worker/test_mamba_utils.py:72`-`140`.
 
 ## Review Hotspots
 

@@ -1,5 +1,5 @@
 diff --git a/tests/v1/core/test_prefix_caching.py b/tests/v1/core/test_prefix_caching.py
-index b8b387fff..592a1b0bb 100644
+index b8b387fff..4196afac3 100644
 --- a/tests/v1/core/test_prefix_caching.py
 +++ b/tests/v1/core/test_prefix_caching.py
 @@ -764,6 +764,39 @@ def _make_hybrid_kv_cache_config(
@@ -42,7 +42,7 @@ index b8b387fff..592a1b0bb 100644
  # Test cases covering various combinations of KV cache spec types:
  # - Varying number of groups (2, 3, or 4)
  # - 0, 1, or 2 full attention groups
-@@ -1008,6 +1041,231 @@ def test_prefill_hybrid_model_mamba_align():
+@@ -1008,6 +1041,233 @@ def test_prefill_hybrid_model_mamba_align():
      manager.free(req0)
  
  
@@ -208,7 +208,9 @@ index b8b387fff..592a1b0bb 100644
 +            blocks,
 +        )
 +        assert allocated is not None
++        mamba_source_block_refs = manager.take_mamba_source_block_refs()
 +        req.num_computed_tokens += num_tokens
++        manager.release_mamba_source_block_refs(mamba_source_block_refs)
 +        manager.new_step_starts()
 +
 +    allocate(64, computed_blocks)
@@ -741,6 +743,179 @@ index e4b77f24b..e12898333 100644
  def assert_scheduler_empty(scheduler: Scheduler):
      """Confirm the scheduler is "empty" - i.e. no leaks."""
      # Scheduler Metadata.
+diff --git a/tests/v1/core/test_single_type_kv_cache_manager.py b/tests/v1/core/test_single_type_kv_cache_manager.py
+index b05040ebe..f107d6e22 100644
+--- a/tests/v1/core/test_single_type_kv_cache_manager.py
++++ b/tests/v1/core/test_single_type_kv_cache_manager.py
+@@ -14,9 +14,14 @@ from vllm.v1.core.kv_cache_utils import (
+ )
+ from vllm.v1.core.single_type_kv_cache_manager import (
+     ChunkedLocalAttentionManager,
++    MambaManager,
+     SlidingWindowManager,
+ )
+-from vllm.v1.kv_cache_interface import ChunkedLocalAttentionSpec, SlidingWindowSpec
++from vllm.v1.kv_cache_interface import (
++    ChunkedLocalAttentionSpec,
++    MambaSpec,
++    SlidingWindowSpec,
++)
+ 
+ pytestmark = pytest.mark.cpu_test
+ 
+@@ -41,6 +46,22 @@ def get_chunked_local_attention_manager(
+     )
+ 
+ 
++def get_latest_mamba_manager(block_size: int, block_pool: BlockPool):
++    return MambaManager(
++        MambaSpec(
++            block_size=block_size,
++            shapes=(1, 1),
++            dtypes=(torch.float32,),
++            mamba_cache_mode="latest",
++            mamba_latest_coarse_block_size=4 * block_size,
++            mamba_latest_coarse_checkpoints=1,
++        ),
++        block_pool=block_pool,
++        enable_caching=True,
++        kv_cache_group_id=0,
++    )
++
++
+ def test_chunked_local_attention_possible_cached_prefix():
+     block_size = 2
+     chunked_local_attention_spec = ChunkedLocalAttentionSpec(
+@@ -322,6 +343,129 @@ def test_sliding_window_remove_skipped_blocks():
+     assert_block_id(block_table, [null_block_id] * 4 + original_block_ids[4:])
+ 
+ 
++def test_latest_mamba_remove_skipped_blocks_keeps_source_state():
++    block_size = 2
++    block_pool = BlockPool(
++        num_gpu_blocks=20, enable_caching=True, hash_block_size=block_size
++    )
++    manager = get_latest_mamba_manager(block_size, block_pool)
++
++    request_id = "test"
++    blocks = block_pool.get_new_blocks(6)
++    original_blocks = list(blocks)
++    manager.req_to_blocks[request_id] = blocks
++    manager._record_source_state_block(request_id, 2)
++    manager.current_state_block_idx[request_id] = 5
++    manager.coarse_checkpoint_block_idx[request_id] = 1
++    manager.latest_checkpoint_block_idx[request_id] = 4
++
++    manager.remove_skipped_blocks(request_id, 12)
++
++    assert blocks[0] == block_pool.null_block
++    assert blocks[1] is original_blocks[1]
++    assert blocks[2] is original_blocks[2]
++    assert blocks[3] == block_pool.null_block
++    assert blocks[4] is original_blocks[4]
++    assert blocks[5] is original_blocks[5]
++
++
++def test_latest_mamba_checkpoint_replacement_keeps_source_state():
++    block_size = 2
++    block_pool = BlockPool(
++        num_gpu_blocks=20, enable_caching=True, hash_block_size=block_size
++    )
++    manager = get_latest_mamba_manager(block_size, block_pool)
++
++    request_id = "test"
++    blocks = block_pool.get_new_blocks(4)
++    original_blocks = list(blocks)
++    manager.req_to_blocks[request_id] = blocks
++    manager._record_source_state_block(request_id, 1)
++    manager.current_state_block_idx[request_id] = 3
++
++    manager._maybe_free_unqueued_checkpoint(request_id, 1)
++    manager._maybe_free_unqueued_checkpoint(request_id, 0)
++
++    assert blocks[0] == block_pool.null_block
++    assert blocks[1] is original_blocks[1]
++
++
++def test_latest_mamba_inflight_source_state_released_on_completion():
++    block_size = 2
++    block_pool = BlockPool(
++        num_gpu_blocks=20, enable_caching=True, hash_block_size=block_size
++    )
++    manager = get_latest_mamba_manager(block_size, block_pool)
++
++    request_id = "test"
++    blocks = block_pool.get_new_blocks(4)
++    original_blocks = list(blocks)
++    manager.req_to_blocks[request_id] = blocks
++    manager.current_state_block_idx[request_id] = 3
++    manager._record_source_state_block(request_id, 1)
++
++    refs = manager.take_mamba_source_block_refs()
++    assert refs == [(0, request_id, 1)]
++
++    manager.new_step_starts()
++    manager.remove_skipped_blocks(request_id, 8)
++    assert blocks[0] == block_pool.null_block
++    assert blocks[1] is original_blocks[1]
++    assert blocks[2] == block_pool.null_block
++
++    manager.release_mamba_source_block_ref(request_id, 1)
++    assert blocks[1] == block_pool.null_block
++
++
++def test_latest_mamba_repeated_source_refs_require_matching_releases():
++    block_size = 2
++    block_pool = BlockPool(
++        num_gpu_blocks=20, enable_caching=True, hash_block_size=block_size
++    )
++    manager = get_latest_mamba_manager(block_size, block_pool)
++
++    request_id = "test"
++    blocks = block_pool.get_new_blocks(4)
++    original_blocks = list(blocks)
++    manager.req_to_blocks[request_id] = blocks
++    manager.current_state_block_idx[request_id] = 3
++
++    manager._record_source_state_block(request_id, 1)
++    assert manager.take_mamba_source_block_refs() == [(0, request_id, 1)]
++    manager._record_source_state_block(request_id, 1)
++    assert manager.take_mamba_source_block_refs() == [(0, request_id, 1)]
++
++    manager.release_mamba_source_block_ref(request_id, 1)
++    manager.remove_skipped_blocks(request_id, 8)
++    assert blocks[1] is original_blocks[1]
++
++    manager.release_mamba_source_block_ref(request_id, 1)
++    assert blocks[1] == block_pool.null_block
++
++
++def test_latest_mamba_inflight_source_state_not_relocated():
++    block_size = 2
++    block_pool = BlockPool(
++        num_gpu_blocks=20, enable_caching=True, hash_block_size=block_size
++    )
++    manager = get_latest_mamba_manager(block_size, block_pool)
++
++    request_id = "test"
++    blocks = block_pool.get_new_blocks(1)
++    source_block = blocks[0]
++    manager.req_to_blocks[request_id] = blocks
++    manager.current_state_block_idx[request_id] = 0
++    manager._allocated_block_reqs.add(request_id)
++    manager._record_source_state_block(request_id, 0)
++    assert manager.take_mamba_source_block_refs() == [(0, request_id, 0)]
++
++    new_blocks = manager._allocate_latest_reused_blocks(request_id, 2 * block_size)
++
++    assert len(new_blocks) == 1
++    assert blocks[0] is source_block
++    assert blocks[1] is not source_block
++
++
+ def test_get_num_blocks_to_allocate():
+     block_size = 2
+     sliding_window_spec = SlidingWindowSpec(
 diff --git a/tests/v1/e2e/general/test_mamba_prefix_cache.py b/tests/v1/e2e/general/test_mamba_prefix_cache.py
 index 747c5defe..deb50b768 100644
 --- a/tests/v1/e2e/general/test_mamba_prefix_cache.py
@@ -764,9 +939,18 @@ index 747c5defe..deb50b768 100644
          mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
          copy_bufs: mamba_utils.MambaCopyBuffers,
 diff --git a/tests/v1/worker/test_mamba_utils.py b/tests/v1/worker/test_mamba_utils.py
-index c5d066147..ebb03c85a 100644
+index c5d066147..b963d7b7e 100644
 --- a/tests/v1/worker/test_mamba_utils.py
 +++ b/tests/v1/worker/test_mamba_utils.py
+@@ -3,7 +3,7 @@
+ from unittest.mock import MagicMock, patch
+ 
+ from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+-from vllm.v1.worker.mamba_utils import preprocess_mamba
++from vllm.v1.worker.mamba_utils import collect_mamba_copy_meta, preprocess_mamba
+ 
+ 
+ def _make_scheduler_output(
 @@ -39,10 +39,10 @@ def test_resumed_req_ids_cleared_from_mamba_state_idx():
      copy_bufs = MagicMock(mamba_group_ids=[0], mamba_spec=spec)
  
@@ -775,16 +959,89 @@ index c5d066147..ebb03c85a 100644
 -        "preempted": 2,
 -        "resumed": 3,  # only in resumed_req_ids, NOT in preempted
 -        "keep": 99,
-+        "finished": (1, (11,)),
-+        "preempted": (2, (12,)),
-+        "resumed": (3, (13,)),  # only in resumed_req_ids, NOT in preempted
-+        "keep": (99, (199,)),
++        "finished": (1, ((11,),)),
++        "preempted": (2, ((12,),)),
++        "resumed": (3, ((13,),)),  # only in resumed_req_ids, NOT in preempted
++        "keep": (99, ((199,),)),
      }
      sched = _make_scheduler_output(
          finished_req_ids={"finished"},
-@@ -66,4 +66,4 @@ def test_resumed_req_ids_cleared_from_mamba_state_idx():
+@@ -66,4 +66,77 @@ def test_resumed_req_ids_cleared_from_mamba_state_idx():
              copy_bufs,
          )
  
 -    assert mamba_state_idx == {"keep": 99}
-+    assert mamba_state_idx == {"keep": (99, (199,))}
++    assert mamba_state_idx == {"keep": (99, ((199,),))}
++
++
++def test_preprocess_mamba_uses_recorded_source_block_ids():
++    spec = MagicMock(block_size=16, num_speculative_blocks=0)
++    cache_config = MagicMock(enable_prefix_caching=True)
++    input_batch = MagicMock(req_ids=["req"], num_accepted_tokens_cpu=[1])
++    copy_bufs = MagicMock(mamba_group_ids=[0], mamba_spec=spec)
++    req_state = MagicMock(
++        num_computed_tokens=16,
++        block_ids=[[999, 1000]],
++    )
++    mamba_state_idx = {"req": (0, ((123,),))}
++    sched = _make_scheduler_output(
++        finished_req_ids=set(),
++        preempted_req_ids=set(),
++        resumed_req_ids=set(),
++    )
++    sched.num_scheduled_tokens = {"req": 1}
++
++    with (
++        patch("vllm.v1.worker.mamba_utils.collect_mamba_copy_meta") as collect_meta,
++        patch("vllm.v1.worker.mamba_utils.do_mamba_copy_block"),
++    ):
++        preprocess_mamba(
++            sched,
++            MagicMock(),
++            cache_config,
++            mamba_state_idx,
++            input_batch,
++            {"req": req_state},
++            {},
++            (),
++            copy_bufs,
++        )
++
++    assert collect_meta.call_args.args[-1] == ((123,),)
++
++
++def test_collect_mamba_copy_meta_uses_recorded_spec_source_offset():
++    copy_bufs = MagicMock(offset=0)
++    copy_bufs.src_ptrs.np = [0]
++    copy_bufs.dst_ptrs.np = [0]
++    copy_bufs.sizes.np = [0]
++    kv_cache_config = MagicMock()
++    kv_cache_config.kv_cache_groups = [MagicMock(layer_names=["layer"])]
++    req_state = MagicMock(block_ids=[[999, 1000, 1001]])
++    state = MagicMock()
++    state.__getitem__.return_value.data_ptr.return_value = 200
++    state.element_size.return_value = 1
++    forward_context = {"layer": MagicMock(kv_cache=[state])}
++    seen_block_ids = None
++
++    def copy_func(state, block_ids, src_block_idx, num_accepted_tokens):
++        nonlocal seen_block_ids
++        seen_block_ids = block_ids
++        assert src_block_idx == 0
++        assert num_accepted_tokens == 2
++        return MagicMock(start_addr=100, num_elements=1)
++
++    collect_mamba_copy_meta(
++        copy_bufs,
++        kv_cache_config,
++        (copy_func,),
++        [0],
++        src_block_idx=0,
++        dest_block_idx=2,
++        accept_token_bias=1,
++        req_state=req_state,
++        forward_context=forward_context,
++        src_block_id_window=((123,), (124,)),
++    )
++
++    assert seen_block_ids == [123, 124, 1001]

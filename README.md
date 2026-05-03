@@ -65,10 +65,10 @@ Local verification run:
 - `PYTHONPYCACHEPREFIX=/tmp/vllm-hybrid-pycache .venv/bin/python -m py_compile ...`: passed for changed production and test Python files.
 - `ruff check ...`: passed for changed production and test Python files.
 - Clean apply check from `b1388b1fb`: `gold.patch` then `test.patch` applied cleanly and `git diff --check` passed.
-- Container targeted tests in `vllm/vllm-openai:v0.19.1`: 15 selected latest-Mamba/MTP tests passed.
+- Container targeted tests in `vllm/vllm-openai:v0.19.1`: 22 selected latest-Mamba/MTP tests passed.
 - Artifact self-test in a fresh `vllm/vllm-openai:v0.19.1` container:
   `scripts/run_tests.sh` applied both patches from clean `b1388b1fb` and
-  passed py_compile, ruff, and 21 targeted latest-Mamba/MTP tests.
+  passed py_compile, ruff, and 22 targeted latest-Mamba/MTP tests.
 - MTP serve smoke: Qwen3.5 35B with `{"method":"mtp","num_speculative_tokens":3}` reached `/v1/models` readiness using the requested serve flags. A first run with `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1` failed for insufficient KV cache memory at `--gpu-memory-utilization 0.86`; rerunning without that estimator env succeeded.
 - Latest smart-copy smoke benchmark: Qwen3.5 35B, TP=2, expert parallel,
   `max_num_batched_tokens=16384`, 2 trajectories, 180 requests completed in
