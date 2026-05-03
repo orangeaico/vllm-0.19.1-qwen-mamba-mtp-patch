@@ -95,6 +95,7 @@ git diff --check
 section "Copy patched tests"
 mkdir -p "$TEST_ROOT"
 cp -a tests "$TEST_ROOT/tests"
+cp pyproject.toml "$TEST_ROOT/pyproject.toml"
 
 section "Remove source checkout before test execution"
 cd /tmp
@@ -151,7 +152,7 @@ PYTHONPYCACHEPREFIX=/tmp/vllm-patch-pycache \
   "$VENV/bin/python" -m py_compile "${PY_FILES[@]}"
 
 section "ruff patched files"
-"$VENV/bin/python" -m ruff check "${PY_FILES[@]}"
+"$VENV/bin/python" -m ruff check --config "$TEST_ROOT/pyproject.toml" "${PY_FILES[@]}"
 
 section "pytest targeted latest-Mamba/MTP coverage"
 cd "$TEST_ROOT"
