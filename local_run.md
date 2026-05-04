@@ -26,6 +26,10 @@ docker run -it --rm \
        /usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py &&
     cp /host-patch/scripts/debug/single_type_kv_cache_manager.py \
        /usr/local/lib/python3.12/dist-packages/vllm/v1/core/single_type_kv_cache_manager.py &&
+    cp /host-patch/scripts/debug/kv_cache_coordinator.py \
+       /usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_coordinator.py &&
+    cp /host-patch/scripts/debug/block_pool.py \
+       /usr/local/lib/python3.12/dist-packages/vllm/v1/core/block_pool.py &&
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 \
     vllm serve /home/shared/megatron_dir/hf_models/Qwen3.5-35B-A3B-FP8 \
       --host 0.0.0.0 --port 3003 \
@@ -55,4 +59,4 @@ docker run -it --rm \
 
 > `run_tests.sh` installs gold.patch into site-packages. The `cp` then overlays the
 > debug-logged files on top before `vllm serve` starts — so nothing can clobber them.
-> To serve without debug logging, remove the two `cp` lines.
+> To serve without debug logging, remove the four `cp` lines.

@@ -483,6 +483,16 @@ class FullAttentionManager(SingleTypeKVCacheManager):
 
     def cache_blocks(self, request: Request, num_tokens: int) -> None:
         super().cache_blocks(request, num_tokens)
+        print(
+            "[ATTN_DEBUG] cache_blocks",
+            "req=", request.request_id,
+            "num_tokens=", num_tokens,
+            "block_size=", self.block_size,
+            "num_full_blocks=", num_tokens // self.block_size,
+            "full_tokens=", (num_tokens // self.block_size) * self.block_size,
+            "enable_partial_cache=", self.enable_partial_cache,
+            flush=True,
+        )
         if not self.enable_partial_cache:
             return
         if not isinstance(self.kv_cache_spec, FullAttentionSpec):
@@ -933,6 +943,15 @@ class MambaManager(SingleTypeKVCacheManager):
 
         old_latest_idx = self.latest_checkpoint_block_idx.get(request_id)
         self.latest_checkpoint_block_idx[request_id] = block_idx
+        print(
+            "[MAMBA_DEBUG] queue_checkpoint",
+            "req=", request.request_id,
+            "block_idx=", block_idx,
+            "tokens=", (block_idx + 1) * self.block_size,
+            "old_latest_idx=", old_latest_idx,
+            "target_coarse_idx=", self._target_coarse_checkpoint_idx(request),
+            flush=True,
+        )
         if old_latest_idx is not None and old_latest_idx != block_idx:
             self._maybe_free_unqueued_checkpoint(request_id, old_latest_idx)
 
@@ -1000,7 +1019,11 @@ class MambaManager(SingleTypeKVCacheManager):
                     computed.append(cached)
                 break  # we just need the last match - early stopping
 
-        hit_blocks = len(computed_blocks[0]) if computed_blocks and computed_blocks[0] else 0
+        hit_blocks = (
+            len(computed_blocks[0])
+            if computed_blocks and computed_blocks[0]
+            else 0
+        )
         print(
             f"[MAMBA_DEBUG] mamba_hit max_tokens={max_length} "
             f"max_blocks={max_num_blocks} hit_blocks={hit_blocks} "
@@ -1354,13 +1377,28 @@ class MambaManager(SingleTypeKVCacheManager):
         if not blocks:
             return
 
+        print(
+            "[MAMBA_DEBUG] finalize_indices",
+            "req=", request_id,
+            "latest_idx=", self.latest_checkpoint_block_idx.get(request_id),
+            "coarse_idx=", self._latest_coarse_checkpoint_cacheable(request),
+            "block_size=", self.block_size,
+            flush=True,
+        )
+
         cache_block_indices = [self.latest_checkpoint_block_idx.get(request_id)]
         cache_block_indices.append(self._latest_coarse_checkpoint_cacheable(request))
+        will_cache = [
+            (idx + 1) * self.block_size
+            for idx in cache_block_indices
+            if idx is not None
+        ]
         print(
             f"[MAMBA_DEBUG] finalize req={request_id[:8]} "
             f"latest_blk={self.latest_checkpoint_block_idx.get(request_id)} "
-            f"coarse_blk={self.coarse_checkpoint_block_idx.get(request_id)} "
-            f"will_cache_tokens={[(idx+1)*self.block_size for idx in cache_block_indices if idx is not None]}",
+            f"coarse_blk="
+            f"{self.coarse_checkpoint_block_idx.get(request_id)} "
+            f"will_cache_tokens={will_cache}",
             flush=True,
         )
         for block_idx in dict.fromkeys(
@@ -1380,6 +1418,14 @@ class MambaManager(SingleTypeKVCacheManager):
                 kv_cache_group_id=self.kv_cache_group_id,
             )
             assert block.block_hash is not None
+            print(
+                "[MAMBA_DEBUG] finalize_cached",
+                "req=", request_id,
+                "block_idx=", block_idx,
+                "tokens=", (block_idx + 1) * self.block_size,
+                "block_hash_set=", block.block_hash is not None,
+                flush=True,
+            )
 
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()

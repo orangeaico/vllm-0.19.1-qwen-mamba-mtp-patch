@@ -248,6 +248,19 @@ class Scheduler(SchedulerInterface):
             and self.dcp_world_size == 1
             and self.pcp_world_size == 1
         )
+        print(
+            "[ATTN_DEBUG] partial_attn_config",
+            "enabled=", enable_partial_attn_cache,
+            "hash_block_size=", self.hash_block_size,
+            "attention_cache_block_size=", self.attention_cache_block_size,
+            "mamba_cache_mode=", self.cache_config.mamba_cache_mode,
+            "has_mamba_layers=", kv_cache_config.has_mamba_layers,
+            "connector=", self.connector is not None,
+            "use_eagle_prefix_cache_drop=", self.use_eagle_prefix_cache_drop,
+            "dcp=", self.dcp_world_size,
+            "pcp=", self.pcp_world_size,
+            flush=True,
+        )
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -459,7 +472,8 @@ class Scheduler(SchedulerInterface):
                 f"[MAMBA_DEBUG] sched req={request.request_id[:8]} "
                 f"computed={num_computed_tokens} proposed_new={num_new_tokens} "
                 f"last_cache_pos={last_cache_position} "
-                f"checkpoints={checkpoints} next_checkpoint={next_checkpoint}",
+                f"checkpoints={checkpoints} "
+                f"next_checkpoint={next_checkpoint}",
                 flush=True,
             )
             if next_checkpoint is not None:
