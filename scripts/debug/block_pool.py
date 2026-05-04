@@ -230,6 +230,17 @@ class BlockPool:
             block_hash_with_group_id = make_block_hash_with_group_id(
                 block_hash, group_id
             )
+            print(
+                "[ATTN_DEBUG] partial_lookup_key",
+                "candidate_hash=", block_hash,
+                "kv_cache_group_id=", group_id,
+                "block_hash_with_group_id=", block_hash_with_group_id,
+                "found=",
+                block_hash_with_group_id in self.cached_partial_block_hash_to_block,
+                "map_size=", len(self.cached_partial_block_hash_to_block),
+                "pool_id=", id(self),
+                flush=True,
+            )
             partial_block = self.cached_partial_block_hash_to_block.get(
                 block_hash_with_group_id
             )
@@ -476,6 +487,17 @@ class BlockPool:
             "valid_tokens=", valid_tokens,
             "hash_idx=", hash_idx,
             "kv_cache_group_id=", kv_cache_group_id,
+            flush=True,
+        )
+        print(
+            "[ATTN_DEBUG] partial_store_key",
+            "boundary_tokens=", boundary_tokens,
+            "hash_idx=", hash_idx,
+            "block_hash=", request.block_hashes[hash_idx],
+            "kv_cache_group_id=", kv_cache_group_id,
+            "block_hash_with_group_id=", block_hash_with_group_id,
+            "map_size_before=", len(self.cached_partial_block_hash_to_block),
+            "pool_id=", id(self),
             flush=True,
         )
         self.cached_partial_block_hash_to_block[block_hash_with_group_id] = (
