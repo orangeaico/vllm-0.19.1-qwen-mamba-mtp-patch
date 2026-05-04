@@ -950,6 +950,10 @@ class MambaManager(SingleTypeKVCacheManager):
             "tokens=", (block_idx + 1) * self.block_size,
             "old_latest_idx=", old_latest_idx,
             "target_coarse_idx=", self._target_coarse_checkpoint_idx(request),
+            "target_coarse_tokens=",
+            ((self._target_coarse_checkpoint_idx(request) + 1) * self.block_size
+             if self._target_coarse_checkpoint_idx(request) is not None
+             else None),
             flush=True,
         )
         if old_latest_idx is not None and old_latest_idx != block_idx:
@@ -1381,6 +1385,9 @@ class MambaManager(SingleTypeKVCacheManager):
             "[MAMBA_DEBUG] finalize_indices",
             "req=", request_id,
             "latest_idx=", self.latest_checkpoint_block_idx.get(request_id),
+            "latest_tokens=",
+            ((self.latest_checkpoint_block_idx[request_id] + 1) * self.block_size
+             if request_id in self.latest_checkpoint_block_idx else None),
             "coarse_idx=", self._latest_coarse_checkpoint_cacheable(request),
             "block_size=", self.block_size,
             flush=True,

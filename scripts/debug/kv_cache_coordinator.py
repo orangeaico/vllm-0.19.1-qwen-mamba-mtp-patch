@@ -720,6 +720,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         "whole_hit_blocks=", num_blocks,
                         "whole_hit_tokens=", num_blocks * spec.block_size,
                         "curr_hit_length_before_partial=", curr_hit_length,
+                        "enable_partial_attn_cache=", self.enable_partial_attn_cache,
                         flush=True,
                     )
                     if self.enable_partial_attn_cache:
@@ -757,8 +758,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                             "max_group_hit_length=", max_group_hit_length,
                             "spec_block_size=", spec.block_size,
                             "whole_hit_blocks=", len(hit_blocks[0]),
-                            "whole_hit_tokens=", len(hit_blocks[0]) * spec.block_size,
+                            "whole_hit_tokens=",
+                            len(hit_blocks[0]) * spec.block_size,
                             "curr_hit_length_before_partial=", curr_hit_length,
+                            "enable_partial_attn_cache=",
+                            self.enable_partial_attn_cache,
                             flush=True,
                         )
                     if is_full_attn and self.enable_partial_attn_cache:

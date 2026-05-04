@@ -259,6 +259,11 @@ class Scheduler(SchedulerInterface):
             "use_eagle_prefix_cache_drop=", self.use_eagle_prefix_cache_drop,
             "dcp=", self.dcp_world_size,
             "pcp=", self.pcp_world_size,
+            "groups=",
+            [
+                (type(group.kv_cache_spec).__name__, group.kv_cache_spec.block_size)
+                for group in kv_cache_config.kv_cache_groups
+            ],
             flush=True,
         )
         self.kv_cache_manager = KVCacheManager(
