@@ -238,7 +238,7 @@ def main():
             "/metrics deltas."
         )
     )
-    parser.add_argument("--base-url", default="http://127.0.0.1:3004")
+    parser.add_argument("--base-url", default="http://127.0.0.1:3003")
     parser.add_argument("--model", default="qwen3")
     parser.add_argument("--turns", type=int, default=10)
     parser.add_argument("--input-tokens", type=int, default=400)
