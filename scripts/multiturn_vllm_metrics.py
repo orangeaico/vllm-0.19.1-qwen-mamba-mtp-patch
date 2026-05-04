@@ -5,29 +5,17 @@ Run this from the host after a vLLM server is reachable. This script sends
 multi-turn chat requests and records per-turn local prefill tokens, cached
 prompt tokens, generated tokens, and generation TPS from vLLM `/metrics`.
 
-Example 10-turn latest-Mamba probe:
+Default 10-turn latest-Mamba probe:
 
     cd /path/to/vllm-0.19.1-qwen-mamba-mtp-patch
-    RUN_DIR="artifacts/mamba_probe_$(date +%Y%m%d_%H%M%S)"
-    SALT="mamba_probe_$(date +%s)"
-    mkdir -p "$RUN_DIR"
-    printf '%s\n' "$SALT" > "$RUN_DIR/cache_salt.txt"
-    python3 scripts/multiturn_vllm_metrics.py \
-      --base-url http://127.0.0.1:3004 \
-      --model qwen3 \
-      --turns 10 \
-      --input-tokens 400 \
-      --output-tokens 200 \
-      --min-output-tokens 200 \
-      --temperature 0 \
-      --cache-salt "$SALT" \
-      --out-dir "$RUN_DIR" \
-      --trace-json
+    python3 scripts/multiturn_vllm_metrics.py
 
-Use `--base-url http://127.0.0.1:3003` when the server is directly on port
-3003, or `--base-url http://127.0.0.1:3004` when the container maps host 3004
-to container 3003. If `--dataset-file` is omitted, the script downloads a small
-public WikiText test split into `.cache/datasets/`.
+Defaults match the local probe we used: `--base-url http://127.0.0.1:3004`,
+`--model qwen3`, `--turns 10`, `--input-tokens 400`, `--output-tokens 200`,
+`--min-output-tokens 200`, `--temperature 0`, and trace JSON enabled. Use
+`--base-url http://127.0.0.1:3003` when the server is directly on port 3003.
+If `--dataset-file` is omitted, the script downloads a small public WikiText
+test split into `.cache/datasets/`.
 """
 
 import argparse
@@ -250,15 +238,15 @@ def main():
             "/metrics deltas."
         )
     )
-    parser.add_argument("--base-url", default="http://127.0.0.1:3003")
+    parser.add_argument("--base-url", default="http://127.0.0.1:3004")
     parser.add_argument("--model", default="qwen3")
     parser.add_argument("--turns", type=int, default=10)
-    parser.add_argument("--input-tokens", type=int, default=1000)
-    parser.add_argument("--output-tokens", type=int, default=10)
+    parser.add_argument("--input-tokens", type=int, default=400)
+    parser.add_argument("--output-tokens", type=int, default=200)
     parser.add_argument(
         "--min-output-tokens",
         type=int,
-        default=None,
+        default=200,
         help="Set vLLM min_tokens; use with --output-tokens to force long decodes.",
     )
     parser.add_argument(
@@ -288,8 +276,16 @@ def main():
     )
     parser.add_argument(
         "--trace-json",
+        dest="trace_json",
         action="store_true",
+        default=True,
         help="Write per-turn tokenization/common-prefix trace JSON.",
+    )
+    parser.add_argument(
+        "--no-trace-json",
+        dest="trace_json",
+        action="store_false",
+        help="Disable per-turn tokenization/common-prefix trace JSON.",
     )
     args = parser.parse_args()
 
@@ -297,6 +293,8 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     run_id = time.strftime("%Y%m%d_%H%M%S")
+    if args.cache_salt is None:
+        args.cache_salt = f"multiturn_probe_{run_id}"
     summary_path = out_dir / f"multiturn_metrics_{run_id}.csv"
     trace_path = out_dir / f"multiturn_trace_{run_id}.json"
 
