@@ -568,7 +568,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             return len(whole_hit_blocks[0]) * block_size, []
 
         whole_hit_length = len(whole_hit_blocks[0]) * block_size
-        max_partial_length = min(max_length, whole_hit_length + block_size - 1)
+        max_partial_length = max_length
         candidate = max_partial_length - max_partial_length % self.hash_block_size
         print(
             "[ATTN_DEBUG] partial_lookup_start",
