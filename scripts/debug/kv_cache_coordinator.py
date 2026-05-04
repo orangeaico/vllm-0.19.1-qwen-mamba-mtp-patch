@@ -16,6 +16,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    FullAttentionManager,
     MambaManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
@@ -552,6 +553,57 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             else lcm(*block_sizes)
         )
 
+    def finalize_request_cache(self, request: Request) -> None:
+        """Finalize cache state, mirroring Mamba checkpoint boundaries into the
+        full-attention partial cache so cross-turn hybrid lookup can hit at the
+        same `B`. Finalize-only by design: registering mid-request boundaries
+        is unsafe under async scheduling and unnecessary for sequential
+        multi-turn workloads.
+        """
+        # 1. Collect Mamba checkpoint boundaries that finalize will commit.
+        #    Read state before delegating; MambaManager.finalize_request_cache
+        #    does not pop these indices, but reading first keeps this
+        #    independent of any future change there.
+        mamba_boundaries: list[int] = []
+        if self.enable_partial_attn_cache:
+            for manager in self.single_type_managers:
+                if not isinstance(manager, MambaManager):
+                    continue
+                if manager.mamba_cache_mode != "latest":
+                    continue
+                request_id = request.request_id
+                block_size = manager.block_size
+                latest_idx = manager.latest_checkpoint_block_idx.get(request_id)
+                coarse_idx = manager._latest_coarse_checkpoint_cacheable(request)
+                for idx in (latest_idx, coarse_idx):
+                    if idx is not None:
+                        mamba_boundaries.append((idx + 1) * block_size)
+
+        # 2. Default finalize: lets MambaManager.cache_full_blocks() actually
+        #    register its checkpoint blocks.
+        super().finalize_request_cache(request)
+
+        # 3. Mirror those boundaries into every FullAttentionManager partial
+        #    cache. Done after super() so the log order is causal:
+        #    MAMBA finalize_cached B -> ATTN cache_partial_store_at_boundary B.
+        if not mamba_boundaries:
+            return
+
+        unique_boundaries = sorted({b for b in mamba_boundaries if b > 0})
+        print(
+            "[ATTN_DEBUG] finalize_mirror_to_full_attn",
+            "req=", request.request_id,
+            "boundaries=", unique_boundaries,
+            flush=True,
+        )
+        for manager in self.single_type_managers:
+            if not isinstance(manager, FullAttentionManager):
+                continue
+            if not manager.enable_partial_cache:
+                continue
+            for boundary in unique_boundaries:
+                manager.cache_partial_boundary(request, boundary)
+
     def _find_partial_full_attention_hit(
         self,
         block_hashes: list[BlockHash],
@@ -576,10 +628,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             "block_size=", block_size,
             "hash_block_size=", self.hash_block_size,
             "whole_hit_length=", len(whole_hit_blocks[0]) * block_size,
-            "max_partial_length=", min(
-                max_length,
-                len(whole_hit_blocks[0]) * block_size + block_size - 1,
-            ),
+            "max_partial_length=", max_partial_length,
             flush=True,
         )
         while candidate > whole_hit_length:

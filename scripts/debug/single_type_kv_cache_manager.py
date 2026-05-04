@@ -505,6 +505,48 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             kv_cache_group_id=self.kv_cache_group_id,
         )
 
+    def cache_partial_boundary(
+        self, request: Request, boundary_tokens: int
+    ) -> None:
+        """Mirror an explicit token boundary into the partial cache.
+
+        Called from the hybrid coordinator at finalize time so that Mamba
+        checkpoint boundaries also become full-attention partial cache
+        entries, enabling cross-turn hybrid hits at the same `B`.
+        """
+        if not self.enable_partial_cache:
+            return
+        if not isinstance(self.kv_cache_spec, FullAttentionSpec):
+            return
+        blocks = self.req_to_blocks.get(request.request_id)
+        if not blocks:
+            # Defensive canary: if this fires, the call-order assumption
+            # ("blocks survive super().finalize_request_cache") is wrong
+            # and the coordinator must mirror BEFORE super().
+            print(
+                "[ATTN_DEBUG] cache_partial_boundary_missing_blocks",
+                "req=", request.request_id,
+                "boundary_tokens=", boundary_tokens,
+                "kv_cache_group_id=", self.kv_cache_group_id,
+                flush=True,
+            )
+            return
+        print(
+            "[ATTN_DEBUG] cache_partial_boundary",
+            "req=", request.request_id,
+            "boundary_tokens=", boundary_tokens,
+            "block_size=", self.block_size,
+            "kv_cache_group_id=", self.kv_cache_group_id,
+            flush=True,
+        )
+        self.block_pool.cache_partial_block_at_boundary(
+            request=request,
+            blocks=blocks,
+            block_size=self.block_size,
+            boundary_tokens=boundary_tokens,
+            kv_cache_group_id=self.kv_cache_group_id,
+        )
+
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         blocks = self.req_to_blocks[running_request_id]
         num_common_blocks = 0

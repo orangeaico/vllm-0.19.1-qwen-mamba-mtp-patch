@@ -376,35 +376,78 @@ class BlockPool:
             )
             return
         boundary_tokens = num_tokens - num_tokens % self.hash_block_size
+        self.cache_partial_block_at_boundary(
+            request=request,
+            blocks=blocks,
+            block_size=block_size,
+            boundary_tokens=boundary_tokens,
+            kv_cache_group_id=kv_cache_group_id,
+        )
+
+    def cache_partial_block_at_boundary(
+        self,
+        request: Request,
+        blocks: list[KVCacheBlock],
+        block_size: int,
+        boundary_tokens: int,
+        kv_cache_group_id: int,
+    ) -> None:
+        """Cache a full-attention partial block at an explicit token boundary.
+
+        Used by the hybrid coordinator to mirror Mamba checkpoint boundaries
+        into the full-attention partial cache so a future request's hybrid
+        lookup can find both halves at the same `B`.
+        """
+        if block_size <= self.hash_block_size:
+            return
+        if boundary_tokens <= 0:
+            return
+        # Snap down to a hash-block-aligned boundary if not already aligned.
+        if boundary_tokens % self.hash_block_size != 0:
+            boundary_tokens -= boundary_tokens % self.hash_block_size
+            if boundary_tokens <= 0:
+                return
+
         valid_tokens = boundary_tokens % block_size
-        if boundary_tokens == 0 or valid_tokens == 0:
+        if valid_tokens == 0:
+            # Whole-block boundary: full-block cache owns this, not partial.
             print(
-                "[ATTN_DEBUG] cache_partial_skip boundary_or_valid_zero",
-                boundary_tokens, valid_tokens, flush=True,
+                "[ATTN_DEBUG] cache_partial_boundary skip valid_tokens=0",
+                "boundary_tokens=", boundary_tokens,
+                "block_size=", block_size,
+                flush=True,
             )
             return
 
         hash_idx = boundary_tokens // self.hash_block_size - 1
-        if hash_idx >= len(request.block_hashes):
+        if hash_idx < 0 or hash_idx >= len(request.block_hashes):
             print(
-                "[ATTN_DEBUG] cache_partial_skip hash_idx_oob",
-                hash_idx, len(request.block_hashes), flush=True,
+                "[ATTN_DEBUG] cache_partial_boundary skip hash_idx_oob",
+                "hash_idx=", hash_idx,
+                "len_hashes=", len(request.block_hashes),
+                "boundary_tokens=", boundary_tokens,
+                flush=True,
             )
             return
 
         block_idx = boundary_tokens // block_size
-        if block_idx >= len(blocks):
+        if block_idx < 0 or block_idx >= len(blocks):
             print(
-                "[ATTN_DEBUG] cache_partial_skip block_idx_oob",
-                block_idx, len(blocks), flush=True,
+                "[ATTN_DEBUG] cache_partial_boundary skip block_idx_oob",
+                "block_idx=", block_idx,
+                "len_blocks=", len(blocks),
+                "boundary_tokens=", boundary_tokens,
+                flush=True,
             )
             return
 
         block = blocks[block_idx]
         if block.is_null:
             print(
-                "[ATTN_DEBUG] cache_partial_skip null_block",
-                block_idx, flush=True,
+                "[ATTN_DEBUG] cache_partial_boundary skip null_block",
+                "block_idx=", block_idx,
+                "boundary_tokens=", boundary_tokens,
+                flush=True,
             )
             return
 
@@ -415,7 +458,9 @@ class BlockPool:
             block_hash_with_group_id
         )
         if old_entry is not None:
-            old_hashes = self.partial_block_id_to_hashes.get(old_entry.block.block_id)
+            old_hashes = self.partial_block_id_to_hashes.get(
+                old_entry.block.block_id
+            )
             if old_hashes is not None:
                 old_hashes.discard(block_hash_with_group_id)
                 if not old_hashes:
@@ -424,12 +469,13 @@ class BlockPool:
                     )
 
         print(
-            "[ATTN_DEBUG] cache_partial_store",
+            "[ATTN_DEBUG] cache_partial_store_at_boundary",
             "req=", request.request_id,
-            "tokens=", boundary_tokens,
+            "boundary_tokens=", boundary_tokens,
             "block_id=", block.block_id,
             "valid_tokens=", valid_tokens,
             "hash_idx=", hash_idx,
+            "kv_cache_group_id=", kv_cache_group_id,
             flush=True,
         )
         self.cached_partial_block_hash_to_block[block_hash_with_group_id] = (
