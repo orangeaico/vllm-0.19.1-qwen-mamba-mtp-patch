@@ -48,15 +48,14 @@ Inside a clean `vllm/vllm-openai:v0.19.1` container, serve one mode:
 
 ```bash
 git clone https://github.com/orangeaico/vllm-0.19.1-qwen-mamba-mtp-patch.git /workspace/patch
-bash /workspace/patch/scripts/serve.sh base --preserve-thinking true
-bash /workspace/patch/scripts/serve.sh mamba --preserve-thinking true
-bash /workspace/patch/scripts/serve.sh mtp --preserve-thinking true
+bash /workspace/patch/scripts/serve.sh base
+bash /workspace/patch/scripts/serve.sh mamba
+bash /workspace/patch/scripts/serve.sh mtp
 ```
 
 Use a fresh container for `base`; `serve.sh mamba` and `serve.sh mtp` install
-`gold.patch` into the container's installed vLLM package. The
-`--preserve-thinking true|false` value is required on every serve run so
-benchmark comparisons do not accidentally mix chat-template settings.
+`gold.patch` into the container's installed vLLM package. The serve scripts do
+not set `preserve_thinking`; vLLM uses the chat-template default for that field.
 
 The production patch includes latest-Mamba prefix-cache support, stable
 latest-minus-one prefill checkpoint publication for chat prompts, matching

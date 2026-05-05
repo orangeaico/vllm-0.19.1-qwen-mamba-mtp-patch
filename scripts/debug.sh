@@ -4,12 +4,11 @@ set -Eeuo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/debug.sh mamba --preserve-thinking true|false [extra vLLM args...]
-  scripts/debug.sh mtp --preserve-thinking true|false [extra vLLM args...]
+  scripts/debug.sh mamba [extra vLLM args...]
+  scripts/debug.sh mtp [extra vLLM args...]
 
 Required arguments:
   mode                         One of: mamba, mtp.
-  --preserve-thinking VALUE    VALUE must be true or false.
 
 Modes:
   mamba  Apply gold.patch into site-packages, overlay debug-logged files,
@@ -25,10 +24,6 @@ Common environment overrides:
   COARSE_CHECKPOINTS, COARSE_MIN_GAP
   NUM_SPECULATIVE_TOKENS, CHAT_TEMPLATE
   PATCH_WORKDIR, SITE_PACKAGES, PYTHON_BIN, RUNTIME_CWD
-
-Preserve-thinking can be passed as --preserve-thinking true|false or as
-PRESERVE_THINKING=true|false. It is required so benchmark runs cannot
-accidentally mix preserve-thinking settings.
 EOF
 }
 
@@ -51,40 +46,6 @@ case "$MODE" in
   *)
     echo "Unknown mode: $MODE (only mamba and mtp are supported for debug)" >&2
     usage >&2
-    exit 2
-    ;;
-esac
-
-PRESERVE_THINKING="${PRESERVE_THINKING:-}"
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --preserve-thinking)
-      if [[ $# -lt 2 ]]; then
-        echo "Missing value for --preserve-thinking; expected true or false." >&2
-        exit 2
-      fi
-      PRESERVE_THINKING="$2"
-      shift 2
-      ;;
-    --preserve-thinking=*)
-      PRESERVE_THINKING="${1#*=}"
-      shift
-      ;;
-    --)
-      shift
-      break
-      ;;
-    *)
-      break
-      ;;
-  esac
-done
-
-case "$PRESERVE_THINKING" in
-  true|false) ;;
-  *)
-    echo "You must provide preserve-thinking explicitly: true or false." >&2
-    echo "Example: scripts/debug.sh $MODE --preserve-thinking true" >&2
     exit 2
     ;;
 esac
@@ -125,7 +86,7 @@ TAIL_CHECKPOINTS="${TAIL_CHECKPOINTS:-0}"
 COARSE_CHECKPOINTS="${COARSE_CHECKPOINTS:-0}"
 COARSE_MIN_GAP="${COARSE_MIN_GAP:-512}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-3}"
-CHAT_TEMPLATE_KWARGS="{\"enable_thinking\": false, \"preserve_thinking\": ${PRESERVE_THINKING}}"
+CHAT_TEMPLATE_KWARGS="${CHAT_TEMPLATE_KWARGS:-{\"enable_thinking\": false}}"
 
 export VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS="${VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:-1}"
 

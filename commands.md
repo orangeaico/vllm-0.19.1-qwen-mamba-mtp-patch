@@ -51,33 +51,33 @@ Serve from a clean container after cloning this artifact repo:
 # base: unpatched v0.19.1 baseline
 docker exec "$CONTAINER" bash -lc '
 cd /workspace/patch &&
-bash scripts/serve.sh base --preserve-thinking true
+bash scripts/serve.sh base
 '
 
 # mamba: patched latest-Mamba, no MTP
 docker exec "$CONTAINER" bash -lc '
 cd /workspace/patch &&
-bash scripts/serve.sh mamba --preserve-thinking true
+bash scripts/serve.sh mamba
 '
 
 # mtp: patched latest-Mamba plus MTP with 3 draft tokens
 docker exec "$CONTAINER" bash -lc '
 cd /workspace/patch &&
-bash scripts/serve.sh mtp --preserve-thinking true
+bash scripts/serve.sh mtp
 '
 ```
 
 Use a fresh container for each serve mode when comparing performance. The
-`mamba` and `mtp` modes patch the installed vLLM package in-place. Pass
-`--preserve-thinking false` instead when you intentionally want that chat
-template behavior; the script refuses to run without an explicit value.
+`mamba` and `mtp` modes patch the installed vLLM package in-place. The serve
+scripts do not set `preserve_thinking`; vLLM uses the chat-template default for
+that field.
 
 Serve with debug logs for latest-Mamba cache flow:
 
 ```bash
 docker exec "$CONTAINER" bash -lc '
 cd /workspace/patch &&
-bash scripts/debug.sh mamba --preserve-thinking true
+bash scripts/debug.sh mamba
 '
 ```
 
@@ -256,7 +256,7 @@ vllm serve Qwen/Qwen3.6-35B-A3B-FP8 \
   --gpu-memory-utilization 0.95 \
   --enable-prefix-caching \
   --language-model-only \
-  --default-chat-template-kwargs '"'"'{"enable_thinking": false, "preserve_thinking": true}'"'"' \
+  --default-chat-template-kwargs '"'"'{"enable_thinking": false}'"'"' \
   --reasoning-parser qwen3 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
