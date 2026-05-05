@@ -554,6 +554,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         )
 
         if self.use_mamba_anchored_partial_cache:
+            # Latest-Mamba partial hits are valid only at Mamba checkpoint
+            # boundaries. Check Mamba first so full attention only validates the
+            # Mamba-approved boundary instead of scanning arbitrary 16-token
+            # partial candidates.
             self.attention_groups = sorted(
                 attention_groups,
                 key=lambda x: isinstance(x[0], FullAttentionSpec),
@@ -578,26 +582,106 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             else lcm(*block_sizes)
         )
 
+    def _find_partial_full_attention_hit(
+        self,
+        block_hashes: list[BlockHash],
+        max_length: int,
+        kv_cache_group_ids: list[int],
+        block_size: int,
+        whole_hit_blocks: tuple[list[KVCacheBlock], ...],
+    ) -> tuple[int, list[PartialKVCacheHit]]:
+        if (
+            not self.enable_partial_attn_cache
+            or self.use_eagle
+            or block_size <= self.hash_block_size
+        ):
+            return len(whole_hit_blocks[0]) * block_size, []
+
+        whole_hit_length = len(whole_hit_blocks[0]) * block_size
+        max_partial_length = min(max_length, whole_hit_length + block_size - 1)
+        candidate = max_partial_length - max_partial_length % self.hash_block_size
+        while candidate > whole_hit_length:
+            hash_idx = candidate // self.hash_block_size - 1
+            if hash_idx >= len(block_hashes):
+                if self.use_mamba_anchored_partial_cache:
+                    break
+                candidate -= self.hash_block_size
+                continue
+
+            partial_blocks = self.block_pool.get_cached_partial_block(
+                block_hashes[hash_idx], kv_cache_group_ids
+            )
+            valid_tokens = candidate % block_size
+            if partial_blocks is not None and all(
+                block.valid_tokens >= valid_tokens for block in partial_blocks
+            ):
+                print(
+                    "[MAMBA_DEBUG] partial_attn_hit",
+                    "candidate=", candidate,
+                    "valid=", valid_tokens,
+                    "groups=", kv_cache_group_ids,
+                    "block_ids=", [b.block.block_id for b in partial_blocks],
+                    flush=True,
+                )
+                block_index = candidate // block_size
+                partial_hits = [
+                    PartialKVCacheHit(
+                        kv_cache_group_id=group_id,
+                        src_block=partial_block.block,
+                        block_index=block_index,
+                        num_tokens=valid_tokens,
+                        hit_length=candidate,
+                    )
+                    for group_id, partial_block in zip(
+                        kv_cache_group_ids, partial_blocks
+                    )
+                ]
+                return candidate, partial_hits
+            if self.use_mamba_anchored_partial_cache:
+                print(
+                    "[MAMBA_DEBUG] partial_attn_miss",
+                    "candidate=", candidate,
+                    "valid=", valid_tokens,
+                    "hash_idx=", hash_idx,
+                    "groups=", kv_cache_group_ids,
+                    flush=True,
+                )
+                break
+            candidate -= self.hash_block_size
+
+        return whole_hit_length, []
+
     def finalize_request_cache(self, request: Request) -> None:
-        """Mirror Mamba checkpoint boundaries into full-attention partial cache."""
         mamba_boundaries: list[int] = []
         if self.use_mamba_anchored_partial_cache:
             for manager in self.single_type_managers:
                 if not isinstance(manager, MambaManager):
                     continue
                 boundary = manager.publish_latest_prefill_checkpoint(request)
+                print(
+                    "[MAMBA_DEBUG] finalize_boundary",
+                    "req=", request.request_id[:8],
+                    "prompt=", request.num_prompt_tokens,
+                    "boundary=", boundary,
+                    flush=True,
+                )
                 if boundary is not None:
                     mamba_boundaries.append(boundary)
 
         super().finalize_request_cache(request)
 
         if not mamba_boundaries:
+            print(
+                "[MAMBA_DEBUG] finalize_no_mirror",
+                "req=", request.request_id[:8],
+                "prompt=", request.num_prompt_tokens,
+                flush=True,
+            )
             return
-
         unique_boundaries = sorted({b for b in mamba_boundaries if b > 0})
         print(
-            "[ATTN_DEBUG] finalize_mirror_to_full_attn",
-            "req=", request.request_id,
+            "[MAMBA_DEBUG] finalize_mirror",
+            "req=", request.request_id[:8],
             "boundaries=", unique_boundaries,
             flush=True,
         )
@@ -619,91 +703,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 manager.publish_completed_latest_checkpoint(
                     request, num_computed_tokens
                 )
-
-    def _find_partial_full_attention_hit(
-        self,
-        block_hashes: list[BlockHash],
-        max_length: int,
-        kv_cache_group_ids: list[int],
-        block_size: int,
-        whole_hit_blocks: tuple[list[KVCacheBlock], ...],
-    ) -> tuple[int, list[PartialKVCacheHit]]:
-        if (
-            not self.enable_partial_attn_cache
-            or self.use_eagle
-            or block_size <= self.hash_block_size
-        ):
-            return len(whole_hit_blocks[0]) * block_size, []
-
-        whole_hit_length = len(whole_hit_blocks[0]) * block_size
-        max_partial_length = max_length
-        candidate = max_partial_length - max_partial_length % self.hash_block_size
-        print(
-            "[ATTN_DEBUG] partial_lookup_start",
-            "max_length=", max_length,
-            "block_size=", block_size,
-            "hash_block_size=", self.hash_block_size,
-            "whole_hit_length=", len(whole_hit_blocks[0]) * block_size,
-            "max_partial_length=", max_partial_length,
-            flush=True,
-        )
-        while candidate > whole_hit_length:
-            hash_idx = candidate // self.hash_block_size - 1
-            if hash_idx >= len(block_hashes):
-                if self.use_mamba_anchored_partial_cache:
-                    break
-                candidate -= self.hash_block_size
-                continue
-
-            partial_blocks = self.block_pool.get_cached_partial_block(
-                block_hashes[hash_idx], kv_cache_group_ids
-            )
-            valid_tokens = candidate % block_size
-            print(
-                "[ATTN_DEBUG] partial_probe",
-                "candidate=", candidate,
-                "hash_idx=", hash_idx,
-                "valid_tokens=", candidate % block_size,
-                "partial_blocks_found=", partial_blocks is not None,
-                "partial_valid_tokens=",
-                ([pb.valid_tokens for pb in partial_blocks]
-                 if partial_blocks is not None else None),
-                flush=True,
-            )
-            if partial_blocks is not None and all(
-                block.valid_tokens >= valid_tokens for block in partial_blocks
-            ):
-                block_index = candidate // block_size
-                partial_hits = [
-                    PartialKVCacheHit(
-                        kv_cache_group_id=group_id,
-                        src_block=partial_block.block,
-                        block_index=block_index,
-                        num_tokens=valid_tokens,
-                        hit_length=candidate,
-                    )
-                    for group_id, partial_block in zip(
-                        kv_cache_group_ids, partial_blocks
-                    )
-                ]
-                print(
-                    "[ATTN_DEBUG] partial_hit",
-                    "candidate=", candidate,
-                    "block_index=", candidate // block_size,
-                    "valid_tokens=", candidate % block_size,
-                    flush=True,
-                )
-                return candidate, partial_hits
-            if self.use_mamba_anchored_partial_cache:
-                break
-            candidate -= self.hash_block_size
-
-        print(
-            "[ATTN_DEBUG] partial_miss_fallback",
-            "returning_whole_hit_length=", whole_hit_length,
-            flush=True,
-        )
-        return whole_hit_length, []
 
     def find_longest_cache_hit(
         self,
@@ -734,16 +733,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             return BlockHashListWithBlockSize(
                 block_hashes, self.hash_block_size, kv_cache_spec.block_size
             )
-
-        print(
-            "[HYBRID_DEBUG] lookup_start",
-            "max_cache_hit_length=", max_cache_hit_length,
-            "num_hashes=", len(block_hashes),
-            "hash_block_size=", self.hash_block_size,
-            "lcm_block_size=", self.lcm_block_size,
-            "enable_partial_attn_cache=", self.enable_partial_attn_cache,
-            flush=True,
-        )
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         self._last_partial_hits = []
@@ -783,16 +772,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         (hit_blocks_by_group[group_id] or [])[:num_blocks]
                         for group_id in group_ids
                     )
-                    print(
-                        "[ATTN_DEBUG] full_attn_whole_hit",
-                        "max_group_hit_length=", max_group_hit_length,
-                        "spec_block_size=", spec.block_size,
-                        "whole_hit_blocks=", num_blocks,
-                        "whole_hit_tokens=", num_blocks * spec.block_size,
-                        "curr_hit_length_before_partial=", curr_hit_length,
-                        "enable_partial_attn_cache=", self.enable_partial_attn_cache,
-                        flush=True,
-                    )
                     if self.enable_partial_attn_cache:
                         curr_hit_length, group_partial_hits = (
                             self._find_partial_full_attention_hit(
@@ -805,13 +784,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         )
                         partial_hits = group_partial_hits or partial_hits
                 else:
-                    if not is_full_attn:
-                        print(
-                            "[HYBRID_DEBUG] before_mamba_lookup",
-                            "mamba_max_length=", max_group_hit_length,
-                            "curr_hit_length=", curr_hit_length,
-                            flush=True,
-                        )
                     hit_blocks = manager_cls.find_longest_cache_hit(
                         block_hashes=_get_block_hashes(spec),
                         max_length=max_group_hit_length,
@@ -822,19 +794,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         alignment_tokens=self.lcm_block_size,
                     )
                     curr_hit_length = len(hit_blocks[0]) * spec.block_size
-                    if is_full_attn:
-                        print(
-                            "[ATTN_DEBUG] full_attn_whole_hit",
-                            "max_group_hit_length=", max_group_hit_length,
-                            "spec_block_size=", spec.block_size,
-                            "whole_hit_blocks=", len(hit_blocks[0]),
-                            "whole_hit_tokens=",
-                            len(hit_blocks[0]) * spec.block_size,
-                            "curr_hit_length_before_partial=", curr_hit_length,
-                            "enable_partial_attn_cache=",
-                            self.enable_partial_attn_cache,
-                            flush=True,
-                        )
                     if is_full_attn and self.enable_partial_attn_cache:
                         curr_hit_length, group_partial_hits = (
                             self._find_partial_full_attention_hit(

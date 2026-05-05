@@ -1,5 +1,5 @@
 diff --git a/tests/v1/core/test_prefix_caching.py b/tests/v1/core/test_prefix_caching.py
-index b8b387fff..3794c2678 100644
+index b8b387fff..8e7af6aba 100644
 --- a/tests/v1/core/test_prefix_caching.py
 +++ b/tests/v1/core/test_prefix_caching.py
 @@ -764,6 +764,40 @@ def _make_hybrid_kv_cache_config(
@@ -43,7 +43,7 @@ index b8b387fff..3794c2678 100644
  # Test cases covering various combinations of KV cache spec types:
  # - Varying number of groups (2, 3, or 4)
  # - 0, 1, or 2 full attention groups
-@@ -1008,6 +1042,268 @@ def test_prefill_hybrid_model_mamba_align():
+@@ -1008,6 +1042,277 @@ def test_prefill_hybrid_model_mamba_align():
      manager.free(req0)
  
  
@@ -65,15 +65,18 @@ index b8b387fff..3794c2678 100644
 +    req0 = make_request("0", list(range(50)), hash_block_size, sha256)
 +    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req0)
 +    assert num_computed_tokens == 0
-+    blocks0 = manager.allocate_slots(req0, 48, 0, computed_blocks)
++    blocks0 = manager.allocate_slots(req0, 32, 0, computed_blocks)
 +    assert blocks0 is not None
++    req0.num_computed_tokens = 32
++    blocks1 = manager.allocate_slots(req0, 16)
++    assert blocks1 is not None
 +    assert not manager.block_pool.cached_partial_block_hash_to_block
 +
 +    manager.free(req0)
 +
-+    partial_key = make_block_hash_with_group_id(req0.block_hashes[2], 0)
++    partial_key = make_block_hash_with_group_id(req0.block_hashes[1], 0)
 +    partial_entry = manager.block_pool.cached_partial_block_hash_to_block[partial_key]
-+    assert partial_entry.valid_tokens == 48
++    assert partial_entry.valid_tokens == 32
 +    source_block = partial_entry.block
 +    assert source_block.block_id == blocks0.blocks[0][0].block_id
 +    assert source_block.block_hash is None
@@ -82,9 +85,9 @@ index b8b387fff..3794c2678 100644
 +
 +    req1 = make_request("1", list(range(50)), hash_block_size, sha256)
 +    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
-+    assert num_computed_tokens == 48
++    assert num_computed_tokens == 32
 +    assert len(computed_blocks.blocks[0]) == 0
-+    assert len(computed_blocks.blocks[1]) == 3
++    assert len(computed_blocks.blocks[1]) == 2
 +
 +    blocks1 = manager.allocate_slots(
 +        req1,
@@ -99,7 +102,7 @@ index b8b387fff..3794c2678 100644
 +    assert copy_ops[0].src_block_id == source_block.block_id
 +    assert copy_ops[0].dst_block_id == blocks1.blocks[0][0].block_id
 +    assert copy_ops[0].dst_block_id != source_block.block_id
-+    assert copy_ops[0].num_tokens == 48
++    assert copy_ops[0].num_tokens == 32
 +    assert source_block.ref_cnt == 1
 +    assert manager.block_pool.blocks[copy_ops[0].dst_block_id].block_hash is None
 +
@@ -124,18 +127,21 @@ index b8b387fff..3794c2678 100644
 +    req0 = make_request("0", list(range(50)), hash_block_size, sha256)
 +    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req0)
 +    assert num_computed_tokens == 0
-+    blocks0 = manager.allocate_slots(req0, 48, 0, computed_blocks)
++    blocks0 = manager.allocate_slots(req0, 32, 0, computed_blocks)
 +    assert blocks0 is not None
++    req0.num_computed_tokens = 32
++    blocks1 = manager.allocate_slots(req0, 16)
++    assert blocks1 is not None
 +    assert not manager.block_pool.cached_partial_block_hash_to_block
 +
 +    manager.free(req0)
 +
-+    latest_key = make_block_hash_with_group_id(req0.block_hashes[2], 0)
-+    prior_key = make_block_hash_with_group_id(req0.block_hashes[1], 0)
++    latest_key = make_block_hash_with_group_id(req0.block_hashes[1], 0)
++    tail_key = make_block_hash_with_group_id(req0.block_hashes[2], 0)
 +    assert manager.block_pool.cached_partial_block_hash_to_block[
 +        latest_key
-+    ].valid_tokens == 48
-+    assert prior_key not in manager.block_pool.cached_partial_block_hash_to_block
++    ].valid_tokens == 32
++    assert tail_key not in manager.block_pool.cached_partial_block_hash_to_block
 +
 +
 +def test_hybrid_latest_publishes_completed_mamba_boundary_before_advance():
@@ -200,18 +206,18 @@ index b8b387fff..3794c2678 100644
 +
 +    manager.free(req0)
 +
-+    latest_key = make_block_hash_with_group_id(req0.block_hashes[2], 0)
-+    prior_key = make_block_hash_with_group_id(req0.block_hashes[1], 0)
-+    assert prior_key not in manager.block_pool.cached_partial_block_hash_to_block
++    latest_key = make_block_hash_with_group_id(req0.block_hashes[1], 0)
++    tail_key = make_block_hash_with_group_id(req0.block_hashes[2], 0)
++    assert tail_key not in manager.block_pool.cached_partial_block_hash_to_block
 +    assert manager.block_pool.cached_partial_block_hash_to_block[
 +        latest_key
-+    ].valid_tokens == 48
++    ].valid_tokens == 32
 +
 +    manager.new_step_starts()
 +
 +    req1 = make_request("1", list(range(40)), hash_block_size, sha256)
 +    partial_blocks = manager.block_pool.get_cached_partial_block(
-+        req1.block_hashes[1], [0]
++        req0.block_hashes[2], [0]
 +    )
 +    assert partial_blocks is None
 +
@@ -261,11 +267,11 @@ index b8b387fff..3794c2678 100644
 +    ]
 +    assert len(non_null_mamba_indices) <= 2
 +
-+    latest_key = make_block_hash_with_group_id(req.block_hashes[9], 1)
++    latest_key = make_block_hash_with_group_id(req.block_hashes[8], 1)
 +    coarse_key = make_block_hash_with_group_id(req.block_hashes[7], 1)
 +    assert manager.block_pool.cached_block_hash_to_block.get_one_block(
 +        latest_key
-+    ) is None
++    ) is not None
 +    assert manager.block_pool.cached_block_hash_to_block.get_one_block(
 +        coarse_key
 +    ) is None
@@ -296,11 +302,14 @@ index b8b387fff..3794c2678 100644
 +
 +    req = make_request("0", list(range(50)), hash_block_size, sha256)
 +    computed_blocks, _ = manager.get_computed_blocks(req)
-+    blocks = manager.allocate_slots(req, 48, 0, computed_blocks)
++    blocks = manager.allocate_slots(req, 32, 0, computed_blocks)
++    assert blocks is not None
++    req.num_computed_tokens = 32
++    blocks = manager.allocate_slots(req, 16)
 +    assert blocks is not None
 +    manager.free(req)
 +
-+    partial_key = make_block_hash_with_group_id(req.block_hashes[2], 0)
++    partial_key = make_block_hash_with_group_id(req.block_hashes[1], 0)
 +    source_block = manager.block_pool.cached_partial_block_hash_to_block[
 +        partial_key
 +    ].block
@@ -313,7 +322,7 @@ index b8b387fff..3794c2678 100644
      """Test prefill with APC and some prompt logprobs (plp) requests.
  
 diff --git a/tests/v1/core/test_scheduler.py b/tests/v1/core/test_scheduler.py
-index e4b77f24b..29c478c1a 100644
+index e4b77f24b..dec22c389 100644
 --- a/tests/v1/core/test_scheduler.py
 +++ b/tests/v1/core/test_scheduler.py
 @@ -24,16 +24,19 @@ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
@@ -336,7 +345,7 @@ index e4b77f24b..29c478c1a 100644
  
  from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
  
-@@ -1661,6 +1664,471 @@ def make_output(scheduler: Scheduler):
+@@ -1661,6 +1664,472 @@ def make_output(scheduler: Scheduler):
      )
  
  
@@ -541,21 +550,22 @@ index e4b77f24b..29c478c1a 100644
 +    scheduler.add_request(req2)
 +    output = scheduler.schedule()
 +
-+    assert req2.num_cached_tokens == 0
-+    assert output.num_scheduled_tokens[req2.request_id] == 256
-+    assert output.kv_cache_block_copy_ops is None
++    assert req2.num_cached_tokens == 992
++    assert output.num_scheduled_tokens[req2.request_id] == 8
++    assert output.kv_cache_block_copy_ops is not None
++    assert len(output.kv_cache_block_copy_ops) == 1
 +    scheduler.finish_requests(req2.request_id, RequestStatus.FINISHED_STOPPED)
 +
 +    scheduler.add_request(req1)
 +    output = scheduler.schedule()
 +
-+    assert req1.num_cached_tokens == 1008
-+    assert output.num_scheduled_tokens[req1.request_id] == 2
++    assert req1.num_cached_tokens == 992
++    assert output.num_scheduled_tokens[req1.request_id] == 18
 +    assert output.kv_cache_block_copy_ops is not None
 +    assert len(output.kv_cache_block_copy_ops) == 1
 +    copy_op = output.kv_cache_block_copy_ops[0]
 +    assert copy_op.kv_cache_group_id == 0
-+    assert copy_op.num_tokens == 48
++    assert copy_op.num_tokens == 32
 +
 +
 +@pytest.mark.parametrize(
@@ -593,8 +603,8 @@ index e4b77f24b..29c478c1a 100644
 +    scheduler.add_request(req1)
 +    output = scheduler.schedule()
 +
-+    assert req1.num_cached_tokens == 0
-+    assert output.num_scheduled_tokens[req1.request_id] == 256
++    assert req1.num_cached_tokens == 992
++    assert output.num_scheduled_tokens[req1.request_id] == 8
 +
 +
 +def test_hybrid_latest_split_positions_target_only_latest_boundary():
@@ -613,11 +623,11 @@ index e4b77f24b..29c478c1a 100644
 +    )
 +
 +    req.num_computed_tokens = 930
-+    assert scheduler._mamba_block_aligned_split(req, 100) == 78
++    assert scheduler._mamba_block_aligned_split(req, 100) == 62
 +    req.num_computed_tokens = 944
-+    assert scheduler._mamba_block_aligned_split(req, 100) == 64
-+    req.num_computed_tokens = 960
 +    assert scheduler._mamba_block_aligned_split(req, 100) == 48
++    req.num_computed_tokens = 960
++    assert scheduler._mamba_block_aligned_split(req, 100) == 32
 +
 +
 +@pytest.mark.parametrize(
@@ -668,7 +678,7 @@ index e4b77f24b..29c478c1a 100644
 +    )
 +
 +    req.num_computed_tokens = 980
-+    assert scheduler._mamba_block_aligned_split(req, 100) == 28
++    assert scheduler._mamba_block_aligned_split(req, 100) == 12
 +
 +
 +@pytest.mark.parametrize("scheduler_cls", [Scheduler, AsyncScheduler])
@@ -758,7 +768,7 @@ index e4b77f24b..29c478c1a 100644
 +    # prompt boundary and recompute the assistant output plus new user tail.
 +    expected_reusable_tokens = (
 +        num_prompt_tokens // mamba_block_size
-+    ) * mamba_block_size
++    ) * mamba_block_size - mamba_block_size
 +    assert req1.num_cached_tokens >= expected_reusable_tokens
 +    assert (
 +        output.num_scheduled_tokens[req1.request_id]
@@ -797,7 +807,7 @@ index e4b77f24b..29c478c1a 100644
 +
 +    expected_next_prompt_boundary = (
 +        len(next_prompt_token_ids) // mamba_block_size
-+    ) * mamba_block_size
++    ) * mamba_block_size - mamba_block_size
 +    assert req2.num_cached_tokens >= expected_next_prompt_boundary
 +    assert (
 +        output.num_scheduled_tokens[req2.request_id]

@@ -248,24 +248,6 @@ class Scheduler(SchedulerInterface):
             and self.dcp_world_size == 1
             and self.pcp_world_size == 1
         )
-        print(
-            "[ATTN_DEBUG] partial_attn_config",
-            "enabled=", enable_partial_attn_cache,
-            "hash_block_size=", self.hash_block_size,
-            "attention_cache_block_size=", self.attention_cache_block_size,
-            "mamba_cache_mode=", self.cache_config.mamba_cache_mode,
-            "has_mamba_layers=", kv_cache_config.has_mamba_layers,
-            "connector=", self.connector is not None,
-            "use_eagle_prefix_cache_drop=", self.use_eagle_prefix_cache_drop,
-            "dcp=", self.dcp_world_size,
-            "pcp=", self.pcp_world_size,
-            "groups=",
-            [
-                (type(group.kv_cache_spec).__name__, group.kv_cache_spec.block_size)
-                for group in kv_cache_config.kv_cache_groups
-            ],
-            flush=True,
-        )
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -400,9 +382,11 @@ class Scheduler(SchedulerInterface):
             ):
                 block_size = self.cache_config.mamba_block_size
                 attn_block_size = self.attention_cache_block_size
-                last_cache_position = (
-                    request.num_tokens - request.num_tokens % block_size
+                prompt_cache_position = (
+                    request.num_prompt_tokens
+                    - request.num_prompt_tokens % block_size
                 )
+                last_cache_position = max(prompt_cache_position - block_size, 0)
                 last_attn_cache_position = (
                     request.num_tokens - request.num_tokens % attn_block_size
                 )
@@ -438,30 +422,6 @@ class Scheduler(SchedulerInterface):
                 )
             elif last_attn_cache_position != last_cache_position:
                 checkpoints.append(last_attn_cache_position)
-            if (
-                self.cache_config.mamba_cache_mode == "latest"
-                and self.cache_config.mamba_block_size is not None
-                and self.cache_config.mamba_latest_tail_checkpoints > 0
-            ):
-                # Chat templates can make the next request's reusable prefix end
-                # before the previous prompt's last 16-token boundary. Keep a
-                # bounded number of tail states available without forcing every
-                # prefill chunk to run at 16-token granularity.
-                checkpoint_stride = (
-                    self.cache_config.mamba_latest_tail_checkpoint_stride
-                    * block_size
-                )
-                checkpoints.extend(
-                    checkpoint
-                    for checkpoint in (
-                        last_cache_position - i * checkpoint_stride
-                        for i in range(
-                            1,
-                            self.cache_config.mamba_latest_tail_checkpoints + 1,
-                        )
-                    )
-                    if checkpoint > 0
-                )
             checkpoints = list(dict.fromkeys(checkpoints))
             next_checkpoint = min(
                 (
@@ -473,14 +433,6 @@ class Scheduler(SchedulerInterface):
                 ),
                 default=None,
             )
-            print(
-                f"[MAMBA_DEBUG] sched req={request.request_id[:8]} "
-                f"computed={num_computed_tokens} proposed_new={num_new_tokens} "
-                f"last_cache_pos={last_cache_position} "
-                f"checkpoints={checkpoints} "
-                f"next_checkpoint={next_checkpoint}",
-                flush=True,
-            )
             if next_checkpoint is not None:
                 num_new_tokens = next_checkpoint - num_computed_tokens
             elif num_computed_tokens_after_sched < last_cache_position:
@@ -489,6 +441,18 @@ class Scheduler(SchedulerInterface):
             else:
                 # prefill the last few tokens
                 pass
+            print(
+                "[MAMBA_DEBUG] split",
+                "req=", request.request_id[:8],
+                "prompt=", request.num_prompt_tokens,
+                "computed=", num_computed_tokens,
+                "requested=", num_computed_tokens_after_sched - num_computed_tokens,
+                "scheduled=", num_new_tokens,
+                "last_cache_position=", last_cache_position,
+                "checkpoints=", checkpoints,
+                "next_checkpoint=", next_checkpoint,
+                flush=True,
+            )
         return num_new_tokens
 
     def _mtp_waiting_prefill_token_reserve(self, token_budget: int) -> int:

@@ -1191,7 +1191,7 @@ index bdb97deca..60172945b 100644
      kv_connector_metadata: KVConnectorMetadata | None = None
  
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index fe524ccac..e17455409 100644
+index fe524ccac..937fa68c2 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -71,6 +71,7 @@ class Scheduler(SchedulerInterface):
@@ -1310,7 +1310,7 @@ index fe524ccac..e17455409 100644
      def _mamba_block_aligned_split(
          self,
          request: Request,
-@@ -324,27 +376,84 @@ class Scheduler(SchedulerInterface):
+@@ -324,27 +376,86 @@ class Scheduler(SchedulerInterface):
              # Additionally, when Eagle mode is enabled, FullAttn prunes the last
              # matching block. To prevent this from causing a Mamba cache miss, the
              # last chunk must be not smaller than `block_size`.
@@ -1322,9 +1322,11 @@ index fe524ccac..e17455409 100644
 +            ):
 +                block_size = self.cache_config.mamba_block_size
 +                attn_block_size = self.attention_cache_block_size
-+                last_cache_position = (
-+                    request.num_tokens - request.num_tokens % block_size
++                prompt_cache_position = (
++                    request.num_prompt_tokens
++                    - request.num_prompt_tokens % block_size
 +                )
++                last_cache_position = max(prompt_cache_position - block_size, 0)
 +                last_attn_cache_position = (
 +                    request.num_tokens - request.num_tokens % attn_block_size
 +                )
@@ -1406,7 +1408,7 @@ index fe524ccac..e17455409 100644
      def schedule(self) -> SchedulerOutput:
          # NOTE(woosuk) on the scheduling algorithm:
          # There's no "decoding phase" nor "prefill phase" in the scheduler.
-@@ -368,6 +477,10 @@ class Scheduler(SchedulerInterface):
+@@ -368,6 +479,10 @@ class Scheduler(SchedulerInterface):
          if self._pause_state == PauseState.PAUSED_ALL:
              # Do not schedule any requests when paused.
              token_budget = 0
@@ -1417,7 +1419,7 @@ index fe524ccac..e17455409 100644
  
          # Encoder-related.
          scheduled_encoder_inputs: dict[str, list[int]] = {}
-@@ -382,7 +495,7 @@ class Scheduler(SchedulerInterface):
+@@ -382,7 +497,7 @@ class Scheduler(SchedulerInterface):
  
          # First, schedule the RUNNING requests.
          req_index = 0
@@ -1426,7 +1428,7 @@ index fe524ccac..e17455409 100644
              request = self.running[req_index]
  
              if (
-@@ -408,7 +521,7 @@ class Scheduler(SchedulerInterface):
+@@ -408,7 +523,7 @@ class Scheduler(SchedulerInterface):
              )
              if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                  num_new_tokens = self.scheduler_config.long_prefill_token_threshold
@@ -1435,7 +1437,7 @@ index fe524ccac..e17455409 100644
  
              # Make sure the input position does not exceed the max model len.
              # This is necessary when using spec decoding.
-@@ -431,7 +544,9 @@ class Scheduler(SchedulerInterface):
+@@ -431,7 +546,9 @@ class Scheduler(SchedulerInterface):
                      request.num_computed_tokens,
                      num_new_tokens,
                      encoder_compute_budget,
@@ -1446,7 +1448,7 @@ index fe524ccac..e17455409 100644
                  )
  
              if self.need_mamba_block_aligned_split:
-@@ -481,7 +596,11 @@ class Scheduler(SchedulerInterface):
+@@ -481,7 +598,11 @@ class Scheduler(SchedulerInterface):
                          if preempted_req in scheduled_running_reqs:
                              preempted_req_id = preempted_req.request_id
                              scheduled_running_reqs.remove(preempted_req)
@@ -1459,7 +1461,7 @@ index fe524ccac..e17455409 100644
                              req_to_new_blocks.pop(preempted_req_id)
                              scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                              preempted_encoder_inputs = scheduled_encoder_inputs.pop(
-@@ -515,6 +634,7 @@ class Scheduler(SchedulerInterface):
+@@ -515,6 +636,7 @@ class Scheduler(SchedulerInterface):
              req_to_new_blocks[request_id] = new_blocks
              num_scheduled_tokens[request_id] = num_new_tokens
              token_budget -= num_new_tokens
@@ -1467,7 +1469,7 @@ index fe524ccac..e17455409 100644
              req_index += 1
  
              # Speculative decode related.
-@@ -692,7 +812,9 @@ class Scheduler(SchedulerInterface):
+@@ -692,7 +814,9 @@ class Scheduler(SchedulerInterface):
                              num_computed_tokens,
                              num_new_tokens,
                              encoder_compute_budget,
@@ -1478,7 +1480,7 @@ index fe524ccac..e17455409 100644
                          )
                          if num_new_tokens == 0:
                              # The request cannot be scheduled.
-@@ -910,6 +1032,12 @@ class Scheduler(SchedulerInterface):
+@@ -910,6 +1034,12 @@ class Scheduler(SchedulerInterface):
              if self.needs_kv_cache_zeroing
              else None
          )
@@ -1491,7 +1493,7 @@ index fe524ccac..e17455409 100644
  
          scheduler_output = SchedulerOutput(
              scheduled_new_reqs=new_reqs_data,
-@@ -927,6 +1055,8 @@ class Scheduler(SchedulerInterface):
+@@ -927,6 +1057,8 @@ class Scheduler(SchedulerInterface):
              finished_req_ids=self.finished_req_ids,
              free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
              new_block_ids_to_zero=new_block_ids_to_zero,
@@ -1500,7 +1502,7 @@ index fe524ccac..e17455409 100644
          )
  
          # NOTE(Kuntai): this function is designed for multiple purposes:
-@@ -1304,6 +1434,10 @@ class Scheduler(SchedulerInterface):
+@@ -1304,6 +1436,10 @@ class Scheduler(SchedulerInterface):
          scheduler_output: SchedulerOutput,
          model_runner_output: ModelRunnerOutput,
      ) -> dict[int, EngineCoreOutputs]:
@@ -1512,7 +1514,7 @@ index fe524ccac..e17455409 100644
          logprobs = model_runner_output.logprobs
          prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
-index fa5395685..c43156967 100644
+index fa5395685..8a69018a7 100644
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
 @@ -39,6 +39,7 @@ class SingleTypeKVCacheManager(ABC):
@@ -1619,7 +1621,7 @@ index fa5395685..c43156967 100644
      def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
          blocks = self.req_to_blocks[running_request_id]
          num_common_blocks = 0
-@@ -774,12 +824,252 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -774,12 +824,266 @@ class MambaManager(SingleTypeKVCacheManager):
          self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
          self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
          self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
@@ -1655,6 +1657,18 @@ index fa5395685..c43156967 100644
 +
 +    def _latest_state_idx(self, num_tokens: int) -> int:
 +        return cdiv(num_tokens, self.block_size) - 1
++
++    def _latest_prefill_checkpoint_idx(self, num_prompt_tokens: int) -> int | None:
++        """Return the latest stable prefill checkpoint block.
++
++        Chat templates can rewrite the generation tail when an assistant
++        response is appended on the next turn. Avoid caching the absolute
++        latest prompt block, which can include those unstable tail tokens.
++        """
++        num_full_blocks = num_prompt_tokens // self.block_size
++        if num_full_blocks < 2:
++            return None
++        return num_full_blocks - 2
 +
 +    def _checkpoint_indices(self, request_id: str) -> set[int]:
 +        checkpoint_indices: set[int] = set()
@@ -1799,13 +1813,18 @@ index fa5395685..c43156967 100644
 +    ) -> None:
 +        if self.mamba_cache_mode != "latest":
 +            return
-+        num_computed_tokens = min(num_computed_tokens, request.num_prompt_tokens)
 +        request_id = request.request_id
++        max_block_idx = self._latest_prefill_checkpoint_idx(
++            request.num_prompt_tokens
++        )
++        if max_block_idx is None:
++            return
++
++        num_computed_tokens = min(num_computed_tokens, request.num_prompt_tokens)
 +        num_full_blocks = num_computed_tokens // self.block_size
 +        if num_full_blocks == 0:
 +            return
-+
-+        block_idx = num_full_blocks - 1
++        block_idx = min(num_full_blocks - 1, max_block_idx)
 +        if self.current_state_block_idx.get(request_id) != block_idx:
 +            return
 +
@@ -1837,14 +1856,11 @@ index fa5395685..c43156967 100644
 +        if self.mamba_cache_mode != "latest":
 +            return None
 +        request_id = request.request_id
-+        prompt_boundary = (
-+            request.num_prompt_tokens
-+            - request.num_prompt_tokens % self.block_size
-+        )
-+        if prompt_boundary == 0:
++        block_idx = self._latest_prefill_checkpoint_idx(request.num_prompt_tokens)
++        if block_idx is None:
 +            return None
 +
-+        block_idx = prompt_boundary // self.block_size - 1
++        prompt_boundary = (block_idx + 1) * self.block_size
 +        blocks = self.req_to_blocks.get(request_id)
 +        if blocks is None or block_idx >= len(blocks):
 +            return None
@@ -1873,7 +1889,7 @@ index fa5395685..c43156967 100644
  
      @classmethod
      def find_longest_cache_hit(
-@@ -839,8 +1129,26 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -839,8 +1143,26 @@ class MambaManager(SingleTypeKVCacheManager):
          # that we might actually need.
          num_computed_tokens = max(0, num_computed_tokens - self.num_speculative_blocks)
  
@@ -1901,7 +1917,7 @@ index fa5395685..c43156967 100644
              # `last_state_block_idx` refers to the block index allocated two steps ago.
              # The block allocated in the previous step is used to copy Mamba states
              # into the block allocated in the current step; the earlier block is
-@@ -854,10 +1162,9 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -854,10 +1176,9 @@ class MambaManager(SingleTypeKVCacheManager):
                  and last_state_block_idx
                  < cdiv(num_computed_tokens, self.block_size) - 1
              ):
@@ -1915,7 +1931,7 @@ index fa5395685..c43156967 100644
  
      def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
          """
-@@ -883,7 +1190,7 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -883,7 +1204,7 @@ class MambaManager(SingleTypeKVCacheManager):
              # that kv_cache_manager will think there is no enough blocks to allocate now
              # and don't schedule it in the current step.
              return self.block_pool.num_gpu_blocks + 1
@@ -1924,7 +1940,7 @@ index fa5395685..c43156967 100644
              # Allocate extra `num_speculative_blocks` blocks for
              # speculative decoding (MTP/EAGLE) with linear attention.
              if self.num_speculative_blocks > 0:
-@@ -910,6 +1217,29 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -910,6 +1231,29 @@ class MambaManager(SingleTypeKVCacheManager):
              num_required_blocks = (
                  cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
              )
@@ -1954,7 +1970,7 @@ index fa5395685..c43156967 100644
              num_new_blocks = (
                  num_required_blocks
                  - len(new_computed_blocks)
-@@ -930,11 +1260,78 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -930,11 +1274,78 @@ class MambaManager(SingleTypeKVCacheManager):
              )
              return num_new_blocks + num_evictable_computed_blocks
  
@@ -2034,7 +2050,7 @@ index fa5395685..c43156967 100644
              # Allocate extra `num_speculative_blocks` blocks for
              # speculative decoding (MTP/EAGLE) with linear attention.
              if self.num_speculative_blocks > 0:
-@@ -949,6 +1346,10 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -949,6 +1360,10 @@ class MambaManager(SingleTypeKVCacheManager):
              # We can ignore lookahead tokens because current draft models don't have
              # mamba layers.
              num_tokens = num_tokens_main_model
@@ -2045,7 +2061,7 @@ index fa5395685..c43156967 100644
              req_blocks: list[KVCacheBlock] = self.req_to_blocks[request_id]
              # NOTE(tdouble): this is an over-estimate of how many blocks we need because
              # num_tokens can include draft tokens that will later be rejected.
-@@ -968,13 +1369,14 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -968,13 +1383,14 @@ class MambaManager(SingleTypeKVCacheManager):
                  if blocks_allocated:
                      # We always save the running state at the last
                      # (1 + num_speculative_blocks) block
@@ -2062,7 +2078,7 @@ index fa5395685..c43156967 100644
  
                  num_skipped_blocks = (
                      num_required_blocks - self.num_speculative_blocks - 1
-@@ -1005,13 +1407,22 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1005,13 +1421,22 @@ class MambaManager(SingleTypeKVCacheManager):
                      assert num_new_blocks <= self.num_speculative_blocks + 1
                  new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
                  req_blocks.extend(new_blocks)
@@ -2086,24 +2102,32 @@ index fa5395685..c43156967 100644
          super().free(request_id)
  
      def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
-@@ -1023,6 +1434,16 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1023,6 +1448,24 @@ class MambaManager(SingleTypeKVCacheManager):
          return num_computed_tokens - 1
  
      def cache_blocks(self, request: Request, num_tokens: int) -> None:
 +        if self.mamba_cache_mode == "latest":
 +            num_tokens = min(num_tokens, request.num_prompt_tokens)
 +            num_full_blocks = num_tokens // self.block_size
++            checkpoint_idx = self._latest_prefill_checkpoint_idx(
++                request.num_prompt_tokens
++            )
++            checkpoint_tokens = (
++                (checkpoint_idx + 1) * self.block_size
++                if checkpoint_idx is not None
++                else 0
++            )
 +            self.num_cached_block[request.request_id] = max(
 +                self.num_cached_block.get(request.request_id, 0), num_full_blocks
 +            )
-+            if num_full_blocks > 0:
-+                self._queue_latest_checkpoint(request, num_full_blocks - 1)
++            if checkpoint_idx is not None and num_tokens >= checkpoint_tokens:
++                self._queue_latest_checkpoint(request, checkpoint_idx)
 +            return
 +
          num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
          super().cache_blocks(request, num_tokens)
          num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
-@@ -1035,8 +1456,79 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1035,8 +1478,79 @@ class MambaManager(SingleTypeKVCacheManager):
                  assert block.block_hash is not None
                  self.cached_blocks_this_step.add(block.block_hash)
  
@@ -2183,7 +2207,7 @@ index fa5395685..c43156967 100644
  
  
  class CrossAttentionManager(SingleTypeKVCacheManager):
-@@ -1097,6 +1589,7 @@ class SinkFullAttentionManager(FullAttentionManager):
+@@ -1097,6 +1611,7 @@ class SinkFullAttentionManager(FullAttentionManager):
          kv_cache_group_id: int,
          dcp_world_size: int = 1,
          pcp_world_size: int = 1,
@@ -2191,7 +2215,7 @@ index fa5395685..c43156967 100644
      ):
          super().__init__(
              kv_cache_spec,
-@@ -1105,6 +1598,7 @@ class SinkFullAttentionManager(FullAttentionManager):
+@@ -1105,6 +1620,7 @@ class SinkFullAttentionManager(FullAttentionManager):
              kv_cache_group_id,
              dcp_world_size,
              pcp_world_size,

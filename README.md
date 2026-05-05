@@ -15,6 +15,9 @@ Artifacts:
   cloning this artifact repo; applies both patches and validates tests.
 - `scripts/serve.sh`: run inside a clean vLLM serve container after cloning
   this artifact repo; serves `base`, patched `mamba`, or patched `mtp`.
+- `scripts/debug.sh`: same serving flow as `serve.sh`, but overlays
+  debug-logged runtime files from `scripts/debug/`.
+- `scripts/multiturn_vllm_metrics.py`: host-side multi-turn metrics probe.
 
 Suggested repo layout:
 
@@ -27,6 +30,9 @@ vllm-0.19.1-qwen-mamba-mtp-patch/
 ├── gold.patch
 ├── test.patch
 └── scripts/
+    ├── debug/
+    ├── debug.sh
+    ├── multiturn_vllm_metrics.py
     ├── run_tests.sh
     └── serve.sh
 ```
@@ -52,13 +58,13 @@ Use a fresh container for `base`; `serve.sh mamba` and `serve.sh mtp` install
 `--preserve-thinking true|false` value is required on every serve run so
 benchmark comparisons do not accidentally mix chat-template settings.
 
-The production patch includes latest-Mamba prefix-cache support, minimal
-latest-boundary Mamba checkpoint publication, matching full-attention partial
-cache reuse, and MTP compatibility. Coarse checkpoints are supported but
-disabled by default. MTP still uses the Eagle proposer path where required, but it
-does not enable Eagle prefix-cache block dropping and does not reserve verifier
-KV lookahead slots. The MTP prefill token reservation is active only for MTP
-with Mamba block-aligned splitting.
+The production patch includes latest-Mamba prefix-cache support, stable
+latest-minus-one prefill checkpoint publication for chat prompts, matching
+full-attention partial cache reuse, and MTP compatibility. Coarse checkpoints
+are supported but disabled by default. MTP still uses the Eagle proposer path
+where required, but it does not enable Eagle prefix-cache block dropping and
+does not reserve verifier KV lookahead slots. The MTP prefill token reservation
+is active only for MTP with Mamba block-aligned splitting.
 
 Local verification run:
 
@@ -81,6 +87,13 @@ Local verification run:
   307 seconds. Request-level local prefill dropped from 9,230.89/request to
   5,154.53/request, and sampled generation throughput increased from
   430.92 tokens/s to 506.10 tokens/s.
+- Latest-minus-one 10-turn probe, Qwen3.5 35B, TP=2, expert parallel,
+  `max_num_batched_tokens=16384`, preserve-thinking true:
+  turns 2-10 averaged 632.67 local prefill tokens and 148.83 generation TPS;
+  turns 6-10 averaged 630.20 local prefill tokens and 148.70 generation TPS.
+  The previously bad turn-6/7 fallback to `cached=2224` was fixed; the clean
+  probe reported turn-6 `cached=2832 prefill=626` and turn-7
+  `cached=3440 prefill=629`.
 
 GPU/container tests and serving benchmarks should be run with the commands in
 `commands.md`.

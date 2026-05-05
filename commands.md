@@ -72,6 +72,30 @@ Use a fresh container for each serve mode when comparing performance. The
 `--preserve-thinking false` instead when you intentionally want that chat
 template behavior; the script refuses to run without an explicit value.
 
+Serve with debug logs for latest-Mamba cache flow:
+
+```bash
+docker exec "$CONTAINER" bash -lc '
+cd /workspace/patch &&
+bash scripts/debug.sh mamba --preserve-thinking true
+'
+```
+
+Run the host-side 10-turn prefill/cache probe against a server on port 3003:
+
+```bash
+cd /path/to/vllm-0.19.1-qwen-mamba-mtp-patch
+python3 scripts/multiturn_vllm_metrics.py \
+  --base-url http://127.0.0.1:3003 \
+  --model qwen3 \
+  --turns 10 \
+  --input-tokens 400 \
+  --output-tokens 200 \
+  --min-output-tokens 200 \
+  --temperature 0 \
+  --trace-json
+```
+
 ## 1. Run Container
 
 ```bash
