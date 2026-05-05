@@ -25,6 +25,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
 )
 from vllm.v1.request import Request
 
@@ -258,6 +259,12 @@ class KVCacheCoordinator(ABC):
         """Commit cache state that is intentionally delayed until request end."""
         for manager in self.single_type_managers:
             manager.finalize_request_cache(request)
+
+    def cache_completed_mamba_boundaries(
+        self, request: Request, num_computed_tokens: int
+    ) -> None:
+        """Publish completed Mamba boundaries before running-state reuse."""
+        return
 
     def free(self, request_id: str) -> None:
         """
@@ -498,6 +505,18 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # different KV cache groups have different block sizes, the actual block size
         # can be a multiple of hash_block_size.
         self.hash_block_size = hash_block_size
+        self.use_mamba_anchored_partial_cache = (
+            enable_partial_attn_cache
+            and any(
+                isinstance(g.kv_cache_spec, MambaSpec)
+                and g.kv_cache_spec.mamba_cache_mode == "latest"
+                for g in kv_cache_config.kv_cache_groups
+            )
+        )
+        if self.use_mamba_anchored_partial_cache:
+            for manager in self.single_type_managers:
+                if isinstance(manager.kv_cache_spec, FullAttentionSpec):
+                    manager.enable_eager_partial_cache = False
         assert all(
             g.kv_cache_spec.block_size % hash_block_size == 0
             for g in kv_cache_config.kv_cache_groups
@@ -534,12 +553,18 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             "HybridKVCacheCoordinator requires at least two attention groups."
         )
 
-        # Put full attention first: its efficient left-to-right scan provides
-        # a tighter initial bound, reducing work for subsequent groups.
-        self.attention_groups = sorted(
-            attention_groups,
-            key=lambda x: not isinstance(x[0], FullAttentionSpec),
-        )
+        if self.use_mamba_anchored_partial_cache:
+            self.attention_groups = sorted(
+                attention_groups,
+                key=lambda x: isinstance(x[0], FullAttentionSpec),
+            )
+        else:
+            # Put full attention first: its efficient left-to-right scan provides
+            # a tighter initial bound, reducing work for subsequent groups.
+            self.attention_groups = sorted(
+                attention_groups,
+                key=lambda x: not isinstance(x[0], FullAttentionSpec),
+            )
 
         # The LCM of the block sizes of all attention types.
         # The cache hit length must be a multiple of the LCM of the block sizes
@@ -554,38 +579,18 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         )
 
     def finalize_request_cache(self, request: Request) -> None:
-        """Finalize cache state, mirroring Mamba checkpoint boundaries into the
-        full-attention partial cache so cross-turn hybrid lookup can hit at the
-        same `B`. Finalize-only by design: registering mid-request boundaries
-        is unsafe under async scheduling and unnecessary for sequential
-        multi-turn workloads.
-        """
-        # 1. Collect Mamba checkpoint boundaries that finalize will commit.
-        #    Read state before delegating; MambaManager.finalize_request_cache
-        #    does not pop these indices, but reading first keeps this
-        #    independent of any future change there.
+        """Mirror Mamba checkpoint boundaries into full-attention partial cache."""
         mamba_boundaries: list[int] = []
-        if self.enable_partial_attn_cache:
+        if self.use_mamba_anchored_partial_cache:
             for manager in self.single_type_managers:
                 if not isinstance(manager, MambaManager):
                     continue
-                if manager.mamba_cache_mode != "latest":
-                    continue
-                request_id = request.request_id
-                block_size = manager.block_size
-                latest_idx = manager.latest_checkpoint_block_idx.get(request_id)
-                coarse_idx = manager._latest_coarse_checkpoint_cacheable(request)
-                for idx in (latest_idx, coarse_idx):
-                    if idx is not None:
-                        mamba_boundaries.append((idx + 1) * block_size)
+                boundary = manager.publish_latest_prefill_checkpoint(request)
+                if boundary is not None:
+                    mamba_boundaries.append(boundary)
 
-        # 2. Default finalize: lets MambaManager.cache_full_blocks() actually
-        #    register its checkpoint blocks.
         super().finalize_request_cache(request)
 
-        # 3. Mirror those boundaries into every FullAttentionManager partial
-        #    cache. Done after super() so the log order is causal:
-        #    MAMBA finalize_cached B -> ATTN cache_partial_store_at_boundary B.
         if not mamba_boundaries:
             return
 
@@ -603,6 +608,17 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 continue
             for boundary in unique_boundaries:
                 manager.cache_partial_boundary(request, boundary)
+
+    def cache_completed_mamba_boundaries(
+        self, request: Request, num_computed_tokens: int
+    ) -> None:
+        if not self.use_mamba_anchored_partial_cache:
+            return
+        for manager in self.single_type_managers:
+            if isinstance(manager, MambaManager):
+                manager.publish_completed_latest_checkpoint(
+                    request, num_computed_tokens
+                )
 
     def _find_partial_full_attention_hit(
         self,
@@ -634,6 +650,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         while candidate > whole_hit_length:
             hash_idx = candidate // self.hash_block_size - 1
             if hash_idx >= len(block_hashes):
+                if self.use_mamba_anchored_partial_cache:
+                    break
                 candidate -= self.hash_block_size
                 continue
 
@@ -676,6 +694,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     flush=True,
                 )
                 return candidate, partial_hits
+            if self.use_mamba_anchored_partial_cache:
+                break
             candidate -= self.hash_block_size
 
         print(
@@ -737,8 +757,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # FIXME (yifan): However, for complex hybrid models with multiple attn
         # groups, we still have the EAGLE spiral block dropping problem. See
         # discussion in issue https://github.com/vllm-project/vllm/issues/32802.
-        is_simple_hybrid = len(self.attention_groups) == 2 and isinstance(
-            self.attention_groups[0][0], FullAttentionSpec
+        is_simple_hybrid = len(self.attention_groups) == 2 and any(
+            isinstance(spec, FullAttentionSpec)
+            for spec, _, _ in self.attention_groups
         )
 
         while True:
@@ -835,9 +856,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             if is_simple_hybrid:
                 break
 
-        # Truncate full attention blocks to final hit_length (if present)
-        spec, group_ids, _ = self.attention_groups[0]
-        if isinstance(spec, FullAttentionSpec):
+        # Truncate blocks to final hit_length. In latest-Mamba mode, Mamba can
+        # be checked before full attention, and full attention may subsequently
+        # reduce the accepted length.
+        for spec, group_ids, _ in self.attention_groups:
             num_blocks = hit_length // spec.block_size
             for group_id in group_ids:
                 if (blks := hit_blocks_by_group[group_id]) is not None:

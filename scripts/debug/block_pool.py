@@ -468,6 +468,12 @@ class BlockPool:
         old_entry = self.cached_partial_block_hash_to_block.get(
             block_hash_with_group_id
         )
+        if (
+            old_entry is not None
+            and old_entry.block.block_id == block.block_id
+            and old_entry.valid_tokens == valid_tokens
+        ):
+            return
         if old_entry is not None:
             old_hashes = self.partial_block_id_to_hashes.get(
                 old_entry.block.block_id

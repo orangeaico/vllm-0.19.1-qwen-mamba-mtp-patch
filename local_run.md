@@ -55,6 +55,7 @@ docker run -it --rm \
       --no-scheduler-reserve-full-isl \
       --mamba-cache-mode latest \
       --mamba-latest-tail-checkpoints 0 \
+      --mamba-latest-coarse-checkpoints 0 \
       --mamba-latest-coarse-min-gap 512
   '
 ```

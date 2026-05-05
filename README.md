@@ -52,9 +52,10 @@ Use a fresh container for `base`; `serve.sh mamba` and `serve.sh mtp` install
 `--preserve-thinking true|false` value is required on every serve run so
 benchmark comparisons do not accidentally mix chat-template settings.
 
-The production patch includes latest-Mamba prefix-cache support, bounded
-latest/coarse Mamba checkpoint queuing, partial full-attention cache reuse, and
-MTP compatibility. MTP still uses the Eagle proposer path where required, but it
+The production patch includes latest-Mamba prefix-cache support, minimal
+latest-boundary Mamba checkpoint publication, matching full-attention partial
+cache reuse, and MTP compatibility. Coarse checkpoints are supported but
+disabled by default. MTP still uses the Eagle proposer path where required, but it
 does not enable Eagle prefix-cache block dropping and does not reserve verifier
 KV lookahead slots. The MTP prefill token reservation is active only for MTP
 with Mamba block-aligned splitting.

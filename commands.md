@@ -194,17 +194,18 @@ PYTHONPYCACHEPREFIX=/tmp/vllm-pycache /tmp/vllm-test-venv/bin/python -m py_compi
   tests/v1/core/test_prefix_caching.py::test_hybrid_latest_mamba_queues_bounded_checkpoints_until_free \
   tests/v1/core/test_prefix_caching.py::test_hybrid_latest_partial_full_attention_hit \
   tests/v1/core/test_prefix_caching.py::test_hybrid_latest_partial_full_attention_only_current_boundary_cached \
-  tests/v1/core/test_prefix_caching.py::test_hybrid_latest_partial_full_attention_explicit_prior_boundary_hit \
+  tests/v1/core/test_prefix_caching.py::test_hybrid_latest_publishes_completed_mamba_boundary_before_advance \
+  tests/v1/core/test_prefix_caching.py::test_hybrid_latest_partial_full_attention_only_mirrors_latest_boundary \
   tests/v1/core/test_prefix_caching.py::test_hybrid_latest_partial_cache_eviction \
   tests/v1/core/test_scheduler.py::test_mtp_speculative_config_keeps_eagle_cache_behaviors_disabled \
   tests/v1/core/test_scheduler.py::test_hybrid_latest_mtp_does_not_reserve_eagle_lookahead_tokens \
   tests/v1/core/test_scheduler.py::test_hybrid_latest_mtp_keeps_partial_prefix_cache_enabled \
   tests/v1/core/test_scheduler.py::test_hybrid_latest_prefix_cache_hit_after_chunked_prefill \
-  tests/v1/core/test_scheduler.py::test_hybrid_latest_tail_checkpoint_policy_controls_cached_prefix \
-  tests/v1/core/test_scheduler.py::test_hybrid_latest_tail_checkpoint_stride_split_positions \
+  tests/v1/core/test_scheduler.py::test_hybrid_latest_tail_checkpoint_policy_does_not_cache_extra_boundaries \
+  tests/v1/core/test_scheduler.py::test_hybrid_latest_split_positions_target_only_latest_boundary \
   tests/v1/core/test_scheduler.py::test_hybrid_latest_coarse_checkpoint_selection \
-  tests/v1/core/test_scheduler.py::test_hybrid_latest_tail_checkpoint_split_policy_async_scheduler \
-  tests/v1/core/test_scheduler.py::test_hybrid_latest_caches_completed_decode_tokens_for_next_turn \
+  tests/v1/core/test_scheduler.py::test_hybrid_latest_split_policy_async_scheduler_targets_latest_boundary \
+  tests/v1/core/test_scheduler.py::test_hybrid_latest_caches_completed_prompt_boundary_for_next_turn \
   tests/v1/core/test_single_type_kv_cache_manager.py::test_latest_mamba_remove_skipped_blocks_keeps_source_state \
   tests/v1/core/test_single_type_kv_cache_manager.py::test_latest_mamba_checkpoint_replacement_keeps_source_state \
   tests/v1/core/test_single_type_kv_cache_manager.py::test_latest_mamba_inflight_source_state_released_on_completion \
@@ -243,6 +244,7 @@ vllm serve Qwen/Qwen3.6-35B-A3B-FP8 \
   --no-scheduler-reserve-full-isl \
   --mamba-cache-mode latest \
   --mamba-latest-tail-checkpoints 0 \
+  --mamba-latest-coarse-checkpoints 0 \
   --mamba-latest-coarse-min-gap 512 \
   --speculative-config '"'"'{"method":"mtp","num_speculative_tokens":3}'"'"'
 '

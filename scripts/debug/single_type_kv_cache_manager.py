@@ -57,6 +57,7 @@ class SingleTypeKVCacheManager(ABC):
         self.block_pool = block_pool
         self.enable_caching = enable_caching
         self.enable_partial_cache = enable_partial_cache
+        self.enable_eager_partial_cache = enable_partial_cache
         self.new_block_ids: list[int] = []
 
         # Mapping from request ID to blocks to track the blocks allocated
@@ -483,6 +484,8 @@ class FullAttentionManager(SingleTypeKVCacheManager):
 
     def cache_blocks(self, request: Request, num_tokens: int) -> None:
         super().cache_blocks(request, num_tokens)
+        if not self.enable_eager_partial_cache:
+            return
         print(
             "[ATTN_DEBUG] cache_blocks",
             "req=", request.request_id,
@@ -943,6 +946,12 @@ class MambaManager(SingleTypeKVCacheManager):
     def _maybe_free_unqueued_checkpoint(self, request_id: str, block_idx: int) -> None:
         if self.mamba_cache_mode != "latest":
             return
+        blocks = self.req_to_blocks.get(request_id)
+        if blocks is None or block_idx < 0 or block_idx >= len(blocks):
+            return
+        block = blocks[block_idx]
+        if not block.is_null and block.block_hash is not None:
+            self.block_pool.evict_blocks({block.block_id})
         self._maybe_free_unprotected_state_block(request_id, block_idx)
 
     def _is_coarse_checkpoint_boundary(self, block_idx: int) -> bool:
@@ -1018,6 +1027,110 @@ class MambaManager(SingleTypeKVCacheManager):
         if latest_boundary - coarse_boundary < self.coarse_checkpoint_min_gap:
             return None
         return coarse_idx
+
+    def get_cacheable_checkpoint_boundaries(self, request: Request) -> list[int]:
+        if self.mamba_cache_mode != "latest":
+            return []
+        request_id = request.request_id
+        cache_block_indices = [self.latest_checkpoint_block_idx.get(request_id)]
+        cache_block_indices.append(self._latest_coarse_checkpoint_cacheable(request))
+        return [
+            (idx + 1) * self.block_size
+            for idx in dict.fromkeys(
+                idx for idx in cache_block_indices if idx is not None
+            )
+        ]
+
+    def publish_completed_latest_checkpoint(
+        self, request: Request, num_computed_tokens: int
+    ) -> None:
+        if self.mamba_cache_mode != "latest":
+            return
+        num_computed_tokens = min(num_computed_tokens, request.num_prompt_tokens)
+        request_id = request.request_id
+        num_full_blocks = num_computed_tokens // self.block_size
+        if num_full_blocks == 0:
+            return
+
+        block_idx = num_full_blocks - 1
+        if self.current_state_block_idx.get(request_id) != block_idx:
+            return
+
+        blocks = self.req_to_blocks.get(request_id)
+        if blocks is None or block_idx >= len(blocks):
+            return
+
+        block = blocks[block_idx]
+        if block.is_null:
+            return
+
+        self.latest_checkpoint_block_idx[request_id] = max(
+            self.latest_checkpoint_block_idx.get(request_id, -1), block_idx
+        )
+        if block.block_hash is not None:
+            return
+
+        print(
+            "[MAMBA_DEBUG] publish_completed_latest",
+            "req=", request_id,
+            "block_idx=", block_idx,
+            "tokens=", (block_idx + 1) * self.block_size,
+            flush=True,
+        )
+        self.block_pool.cache_full_blocks(
+            request=request,
+            blocks=blocks,
+            num_cached_blocks=block_idx,
+            num_full_blocks=block_idx + 1,
+            block_size=self.block_size,
+            kv_cache_group_id=self.kv_cache_group_id,
+        )
+        assert block.block_hash is not None
+
+    def publish_latest_prefill_checkpoint(self, request: Request) -> int | None:
+        if self.mamba_cache_mode != "latest":
+            return None
+        request_id = request.request_id
+        prompt_boundary = (
+            request.num_prompt_tokens
+            - request.num_prompt_tokens % self.block_size
+        )
+        if prompt_boundary == 0:
+            return None
+
+        block_idx = prompt_boundary // self.block_size - 1
+        blocks = self.req_to_blocks.get(request_id)
+        if blocks is None or block_idx >= len(blocks):
+            return None
+
+        block = blocks[block_idx]
+        if block.is_null:
+            return None
+
+        old_latest_idx = self.latest_checkpoint_block_idx.get(request_id)
+        self.latest_checkpoint_block_idx[request_id] = block_idx
+        if old_latest_idx is not None and old_latest_idx != block_idx:
+            self._maybe_free_unqueued_checkpoint(request_id, old_latest_idx)
+
+        if block.block_hash is None:
+            print(
+                "[MAMBA_DEBUG] publish_latest_prefill",
+                "req=", request_id,
+                "block_idx=", block_idx,
+                "tokens=", prompt_boundary,
+                flush=True,
+            )
+            self.block_pool.cache_full_blocks(
+                request=request,
+                blocks=blocks,
+                num_cached_blocks=block_idx,
+                num_full_blocks=block_idx + 1,
+                block_size=self.block_size,
+                kv_cache_group_id=self.kv_cache_group_id,
+            )
+            assert block.block_hash is not None
+
+        return prompt_boundary
 
     @classmethod
     def find_longest_cache_hit(
@@ -1394,6 +1507,7 @@ class MambaManager(SingleTypeKVCacheManager):
 
     def cache_blocks(self, request: Request, num_tokens: int) -> None:
         if self.mamba_cache_mode == "latest":
+            num_tokens = min(num_tokens, request.num_prompt_tokens)
             num_full_blocks = num_tokens // self.block_size
             self.num_cached_block[request.request_id] = max(
                 self.num_cached_block.get(request.request_id, 0), num_full_blocks
@@ -1423,6 +1537,7 @@ class MambaManager(SingleTypeKVCacheManager):
         if not blocks:
             return
 
+        self.publish_latest_prefill_checkpoint(request)
         print(
             "[MAMBA_DEBUG] finalize_indices",
             "req=", request_id,
@@ -1435,8 +1550,10 @@ class MambaManager(SingleTypeKVCacheManager):
             flush=True,
         )
 
-        cache_block_indices = [self.latest_checkpoint_block_idx.get(request_id)]
-        cache_block_indices.append(self._latest_coarse_checkpoint_cacheable(request))
+        cache_block_indices = [
+            boundary // self.block_size - 1
+            for boundary in self.get_cacheable_checkpoint_boundaries(request)
+        ]
         will_cache = [
             (idx + 1) * self.block_size
             for idx in cache_block_indices

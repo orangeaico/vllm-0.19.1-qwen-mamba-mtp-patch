@@ -1,8 +1,8 @@
 diff --git a/tests/v1/core/test_prefix_caching.py b/tests/v1/core/test_prefix_caching.py
-index b8b387fff..4196afac3 100644
+index b8b387fff..3794c2678 100644
 --- a/tests/v1/core/test_prefix_caching.py
 +++ b/tests/v1/core/test_prefix_caching.py
-@@ -764,6 +764,39 @@ def _make_hybrid_kv_cache_config(
+@@ -764,6 +764,40 @@ def _make_hybrid_kv_cache_config(
      )
  
  
@@ -10,6 +10,7 @@ index b8b387fff..4196afac3 100644
 +    attn_block_size: int = 64,
 +    mamba_block_size: int = 16,
 +    num_blocks: int = 20,
++    coarse_checkpoints: int = 0,
 +) -> KVCacheConfig:
 +    return KVCacheConfig(
 +        num_blocks=num_blocks,
@@ -32,7 +33,7 @@ index b8b387fff..4196afac3 100644
 +                    dtypes=(torch.float32,),
 +                    mamba_cache_mode="latest",
 +                    mamba_latest_coarse_block_size=attn_block_size,
-+                    mamba_latest_coarse_checkpoints=1,
++                    mamba_latest_coarse_checkpoints=coarse_checkpoints,
 +                ),
 +            ),
 +        ],
@@ -42,7 +43,7 @@ index b8b387fff..4196afac3 100644
  # Test cases covering various combinations of KV cache spec types:
  # - Varying number of groups (2, 3, or 4)
  # - 0, 1, or 2 full attention groups
-@@ -1008,6 +1041,233 @@ def test_prefill_hybrid_model_mamba_align():
+@@ -1008,6 +1042,268 @@ def test_prefill_hybrid_model_mamba_align():
      manager.free(req0)
  
  
@@ -66,6 +67,9 @@ index b8b387fff..4196afac3 100644
 +    assert num_computed_tokens == 0
 +    blocks0 = manager.allocate_slots(req0, 48, 0, computed_blocks)
 +    assert blocks0 is not None
++    assert not manager.block_pool.cached_partial_block_hash_to_block
++
++    manager.free(req0)
 +
 +    partial_key = make_block_hash_with_group_id(req0.block_hashes[2], 0)
 +    partial_entry = manager.block_pool.cached_partial_block_hash_to_block[partial_key]
@@ -75,7 +79,6 @@ index b8b387fff..4196afac3 100644
 +    assert source_block.block_hash is None
 +
 +    manager.new_step_starts()
-+    manager.free(req0)
 +
 +    req1 = make_request("1", list(range(50)), hash_block_size, sha256)
 +    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
@@ -123,6 +126,9 @@ index b8b387fff..4196afac3 100644
 +    assert num_computed_tokens == 0
 +    blocks0 = manager.allocate_slots(req0, 48, 0, computed_blocks)
 +    assert blocks0 is not None
++    assert not manager.block_pool.cached_partial_block_hash_to_block
++
++    manager.free(req0)
 +
 +    latest_key = make_block_hash_with_group_id(req0.block_hashes[2], 0)
 +    prior_key = make_block_hash_with_group_id(req0.block_hashes[1], 0)
@@ -131,10 +137,43 @@ index b8b387fff..4196afac3 100644
 +    ].valid_tokens == 48
 +    assert prior_key not in manager.block_pool.cached_partial_block_hash_to_block
 +
++
++def test_hybrid_latest_publishes_completed_mamba_boundary_before_advance():
++    hash_block_size = 16
++    manager = KVCacheManager(
++        _make_hybrid_latest_kv_cache_config(
++            attn_block_size=64,
++            mamba_block_size=hash_block_size,
++            num_blocks=20,
++        ),
++        max_model_len=8192,
++        enable_caching=True,
++        hash_block_size=hash_block_size,
++        enable_partial_attn_cache=True,
++    )
++
++    req0 = make_request("0", list(range(65)), hash_block_size, sha256)
++    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req0)
++    assert num_computed_tokens == 0
++    blocks0 = manager.allocate_slots(req0, 48, 0, computed_blocks)
++    assert blocks0 is not None
++
++    mamba_manager = manager.coordinator.single_type_managers[1]
++    boundary_block = mamba_manager.req_to_blocks[req0.request_id][2]
++    assert boundary_block.block_hash is None
++
++    req0.num_computed_tokens = 48
++    blocks1 = manager.allocate_slots(req0, 1)
++    assert blocks1 is not None
++
++    assert boundary_block.block_hash is not None
++    assert mamba_manager.current_state_block_idx[req0.request_id] == 3
++    assert mamba_manager.latest_checkpoint_block_idx[req0.request_id] == 2
++
 +    manager.free(req0)
 +
 +
-+def test_hybrid_latest_partial_full_attention_explicit_prior_boundary_hit():
++def test_hybrid_latest_partial_full_attention_only_mirrors_latest_boundary():
 +    hash_block_size = 16
 +    manager = KVCacheManager(
 +        _make_hybrid_latest_kv_cache_config(
@@ -157,26 +196,24 @@ index b8b387fff..4196afac3 100644
 +    req0.num_computed_tokens = 32
 +    blocks1 = manager.allocate_slots(req0, 16)
 +    assert blocks1 is not None
++    assert not manager.block_pool.cached_partial_block_hash_to_block
++
++    manager.free(req0)
 +
 +    latest_key = make_block_hash_with_group_id(req0.block_hashes[2], 0)
 +    prior_key = make_block_hash_with_group_id(req0.block_hashes[1], 0)
-+    assert manager.block_pool.cached_partial_block_hash_to_block[
-+        prior_key
-+    ].valid_tokens == 32
++    assert prior_key not in manager.block_pool.cached_partial_block_hash_to_block
 +    assert manager.block_pool.cached_partial_block_hash_to_block[
 +        latest_key
 +    ].valid_tokens == 48
 +
 +    manager.new_step_starts()
-+    manager.free(req0)
 +
 +    req1 = make_request("1", list(range(40)), hash_block_size, sha256)
 +    partial_blocks = manager.block_pool.get_cached_partial_block(
 +        req1.block_hashes[1], [0]
 +    )
-+    assert partial_blocks is not None
-+    assert partial_blocks[0].valid_tokens == 32
-+    assert partial_blocks[0].block.block_id == blocks0.blocks[0][0].block_id
++    assert partial_blocks is None
 +
 +    manager.free(req1)
 +
@@ -240,7 +277,7 @@ index b8b387fff..4196afac3 100644
 +    ) is not None
 +    assert manager.block_pool.cached_block_hash_to_block.get_one_block(
 +        coarse_key
-+    ) is not None
++    ) is None
 +
 +
 +def test_hybrid_latest_partial_cache_eviction():
@@ -261,6 +298,7 @@ index b8b387fff..4196afac3 100644
 +    computed_blocks, _ = manager.get_computed_blocks(req)
 +    blocks = manager.allocate_slots(req, 48, 0, computed_blocks)
 +    assert blocks is not None
++    manager.free(req)
 +
 +    partial_key = make_block_hash_with_group_id(req.block_hashes[2], 0)
 +    source_block = manager.block_pool.cached_partial_block_hash_to_block[
@@ -270,14 +308,12 @@ index b8b387fff..4196afac3 100644
 +    assert partial_key not in manager.block_pool.cached_partial_block_hash_to_block
 +    assert source_block.block_id not in manager.block_pool.partial_block_id_to_hashes
 +
-+    manager.free(req)
-+
 +
  def test_prefill_plp():
      """Test prefill with APC and some prompt logprobs (plp) requests.
  
 diff --git a/tests/v1/core/test_scheduler.py b/tests/v1/core/test_scheduler.py
-index e4b77f24b..e12898333 100644
+index e4b77f24b..29c478c1a 100644
 --- a/tests/v1/core/test_scheduler.py
 +++ b/tests/v1/core/test_scheduler.py
 @@ -24,16 +24,19 @@ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
@@ -300,7 +336,7 @@ index e4b77f24b..e12898333 100644
  
  from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
  
-@@ -1661,6 +1664,442 @@ def make_output(scheduler: Scheduler):
+@@ -1661,6 +1664,471 @@ def make_output(scheduler: Scheduler):
      )
  
  
@@ -324,9 +360,9 @@ index e4b77f24b..e12898333 100644
 +
 +def _make_hybrid_latest_scheduler(
 +    *,
-+    tail_checkpoints: int = 1,
++    tail_checkpoints: int = 0,
 +    tail_checkpoint_stride: int = 1,
-+    coarse_checkpoints: int = 1,
++    coarse_checkpoints: int = 0,
 +    coarse_min_gap: int = 0,
 +    speculative_method: str | None = None,
 +    num_speculative_tokens: int = 3,
@@ -505,8 +541,8 @@ index e4b77f24b..e12898333 100644
 +    scheduler.add_request(req2)
 +    output = scheduler.schedule()
 +
-+    assert req2.num_cached_tokens == 960
-+    assert output.num_scheduled_tokens[req2.request_id] == 16
++    assert req2.num_cached_tokens == 0
++    assert output.num_scheduled_tokens[req2.request_id] == 256
 +    assert output.kv_cache_block_copy_ops is None
 +    scheduler.finish_requests(req2.request_id, RequestStatus.FINISHED_STOPPED)
 +
@@ -523,23 +559,12 @@ index e4b77f24b..e12898333 100644
 +
 +
 +@pytest.mark.parametrize(
-+    (
-+        "tail_checkpoints",
-+        "tail_checkpoint_stride",
-+        "expected_cached_tokens",
-+        "expected_scheduled_tokens",
-+    ),
-+    [
-+        (0, 1, 960, 32),
-+        (1, 2, 960, 32),
-+        (2, 1, 960, 16),
-+    ],
++    ("tail_checkpoints", "tail_checkpoint_stride"),
++    [(0, 1), (1, 2), (2, 1)],
 +)
-+def test_hybrid_latest_tail_checkpoint_policy_controls_cached_prefix(
++def test_hybrid_latest_tail_checkpoint_policy_does_not_cache_extra_boundaries(
 +    tail_checkpoints: int,
 +    tail_checkpoint_stride: int,
-+    expected_cached_tokens: int,
-+    expected_scheduled_tokens: int,
 +):
 +    mamba_block_size = 16
 +    scheduler = _make_hybrid_latest_scheduler(
@@ -568,11 +593,11 @@ index e4b77f24b..e12898333 100644
 +    scheduler.add_request(req1)
 +    output = scheduler.schedule()
 +
-+    assert req1.num_cached_tokens == expected_cached_tokens
-+    assert output.num_scheduled_tokens[req1.request_id] == expected_scheduled_tokens
++    assert req1.num_cached_tokens == 0
++    assert output.num_scheduled_tokens[req1.request_id] == 256
 +
 +
-+def test_hybrid_latest_tail_checkpoint_stride_split_positions():
++def test_hybrid_latest_split_positions_target_only_latest_boundary():
 +    mamba_block_size = 16
 +    scheduler = _make_hybrid_latest_scheduler(
 +        tail_checkpoints=2,
@@ -588,11 +613,11 @@ index e4b77f24b..e12898333 100644
 +    )
 +
 +    req.num_computed_tokens = 930
-+    assert scheduler._mamba_block_aligned_split(req, 100) == 14
++    assert scheduler._mamba_block_aligned_split(req, 100) == 78
 +    req.num_computed_tokens = 944
-+    assert scheduler._mamba_block_aligned_split(req, 100) == 16
++    assert scheduler._mamba_block_aligned_split(req, 100) == 64
 +    req.num_computed_tokens = 960
-+    assert scheduler._mamba_block_aligned_split(req, 100) == 16
++    assert scheduler._mamba_block_aligned_split(req, 100) == 48
 +
 +
 +@pytest.mark.parametrize(
@@ -627,7 +652,7 @@ index e4b77f24b..e12898333 100644
 +    )
 +
 +
-+def test_hybrid_latest_tail_checkpoint_split_policy_async_scheduler():
++def test_hybrid_latest_split_policy_async_scheduler_targets_latest_boundary():
 +    scheduler = _make_hybrid_latest_scheduler(
 +        tail_checkpoints=1,
 +        tail_checkpoint_stride=1,
@@ -643,11 +668,11 @@ index e4b77f24b..e12898333 100644
 +    )
 +
 +    req.num_computed_tokens = 980
-+    assert scheduler._mamba_block_aligned_split(req, 100) == 12
++    assert scheduler._mamba_block_aligned_split(req, 100) == 28
 +
 +
 +@pytest.mark.parametrize("scheduler_cls", [Scheduler, AsyncScheduler])
-+def test_hybrid_latest_caches_completed_decode_tokens_for_next_turn(
++def test_hybrid_latest_caches_completed_prompt_boundary_for_next_turn(
 +    scheduler_cls: type[Scheduler],
 +):
 +    mamba_block_size = 16
@@ -727,16 +752,56 @@ index e4b77f24b..e12898333 100644
 +    scheduler.add_request(req1)
 +    output = scheduler.schedule()
 +
-+    # The completed assistant response from req0 should be committed to prefix
-+    # cache and reusable by the next turn. The second request should recompute
-+    # only the new user/template tail, not the 200 decoded assistant tokens.
++    # Live serving updates the cross-request prefix cache at prompt-prefill
++    # boundaries. Decoded tokens become reusable after they are included in a
++    # later request prompt, so req1 should at least reuse req0's completed
++    # prompt boundary and recompute the assistant output plus new user tail.
 +    expected_reusable_tokens = (
-+        (num_prompt_tokens + num_output_tokens) // mamba_block_size
++        num_prompt_tokens // mamba_block_size
 +    ) * mamba_block_size
 +    assert req1.num_cached_tokens >= expected_reusable_tokens
 +    assert (
 +        output.num_scheduled_tokens[req1.request_id]
 +        <= req1.num_prompt_tokens - expected_reusable_tokens
++    )
++
++    pending_outputs = [output]
++    num_steps = 0
++    while pending_outputs:
++        output = pending_outputs.pop(0)
++        scheduler.update_from_output(output, make_model_runner_output(output))
++        output = scheduler.schedule()
++        if output.num_scheduled_tokens:
++            pending_outputs.append(output)
++        num_steps += 1
++        assert num_steps < 512
++
++    assert scheduler.get_num_unfinished_requests() == 0
++
++    (req2,) = create_requests(
++        num_requests=1,
++        num_tokens=len(next_prompt_token_ids),
++        max_tokens=1,
++        same_prompt=True,
++        block_size=mamba_block_size,
++        req_ids=["2"],
++    )
++    req2.prompt_token_ids = next_prompt_token_ids
++    req2._all_token_ids = req2.prompt_token_ids.copy()
++    req2.all_token_ids = ConstantList(req2._all_token_ids)
++    req2.block_hashes = []
++    req2.update_block_hashes()
++
++    scheduler.add_request(req2)
++    output = scheduler.schedule()
++
++    expected_next_prompt_boundary = (
++        len(next_prompt_token_ids) // mamba_block_size
++    ) * mamba_block_size
++    assert req2.num_cached_tokens >= expected_next_prompt_boundary
++    assert (
++        output.num_scheduled_tokens[req2.request_id]
++        <= req2.num_prompt_tokens - expected_next_prompt_boundary
 +    )
 +
 +

@@ -21,7 +21,8 @@ Run inside a vllm/vllm-openai:v0.19.1 container after cloning this artifact repo
 
 Common environment overrides:
   MODEL_PATH, SERVED_MODEL_NAME, HOST, PORT, GPU_MEMORY_UTILIZATION
-  MAX_MODEL_LEN, MAX_NUM_BATCHED_TOKENS, TAIL_CHECKPOINTS, COARSE_MIN_GAP
+  MAX_MODEL_LEN, MAX_NUM_BATCHED_TOKENS, TAIL_CHECKPOINTS
+  COARSE_CHECKPOINTS, COARSE_MIN_GAP
   NUM_SPECULATIVE_TOKENS, CHAT_TEMPLATE
   PATCH_WORKDIR, SITE_PACKAGES, PYTHON_BIN, RUNTIME_CWD
 
@@ -121,6 +122,7 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-2}"
 TAIL_CHECKPOINTS="${TAIL_CHECKPOINTS:-0}"
+COARSE_CHECKPOINTS="${COARSE_CHECKPOINTS:-0}"
 COARSE_MIN_GAP="${COARSE_MIN_GAP:-512}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-3}"
 CHAT_TEMPLATE_KWARGS="{\"enable_thinking\": false, \"preserve_thinking\": ${PRESERVE_THINKING}}"
@@ -378,6 +380,7 @@ case "$MODE" in
     MODE_ARGS=(
       --mamba-cache-mode latest
       --mamba-latest-tail-checkpoints "$TAIL_CHECKPOINTS"
+      --mamba-latest-coarse-checkpoints "$COARSE_CHECKPOINTS"
       --mamba-latest-coarse-min-gap "$COARSE_MIN_GAP"
     )
     ;;
@@ -386,6 +389,7 @@ case "$MODE" in
     MODE_ARGS=(
       --mamba-cache-mode latest
       --mamba-latest-tail-checkpoints "$TAIL_CHECKPOINTS"
+      --mamba-latest-coarse-checkpoints "$COARSE_CHECKPOINTS"
       --mamba-latest-coarse-min-gap "$COARSE_MIN_GAP"
       --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${NUM_SPECULATIVE_TOKENS}}"
     )
