@@ -1069,6 +1069,9 @@ class MambaManager(SingleTypeKVCacheManager):
         if block_idx is None:
             return None
 
+        if self.current_state_block_idx.get(request_id) != block_idx:
+            return None
+
         prompt_boundary = (block_idx + 1) * self.block_size
         blocks = self.req_to_blocks.get(request_id)
         if blocks is None or block_idx >= len(blocks):
