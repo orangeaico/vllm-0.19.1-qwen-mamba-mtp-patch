@@ -7,10 +7,8 @@ Artifacts:
 - `gold.patch`: production runtime files under `vllm/` only.
 - `test.patch`: test files under `tests/` only.
 - `commands.md`: paste-ready reproduction and serve commands.
-- `gold_patch_technical_flow.md`: detailed analysis of `gold.patch`, its
-  changed production files, and the end-to-end runtime flow.
-- `flow_review.md`: end-to-end runtime flow and contract review with code
-  references for base, latest-Mamba, and MTP modes.
+- `base.flow`: clean v0.19.1 baseline serving and cache flow.
+- `optim.flow`: patched latest-Mamba and MTP serving, cache, and review flow.
 - `scripts/run_tests.sh`: run inside a clean vLLM serve container after
   cloning this artifact repo; applies both patches and validates tests.
 - `scripts/serve.sh`: run inside a clean vLLM serve container after cloning
@@ -25,8 +23,8 @@ Suggested repo layout:
 vllm-0.19.1-qwen-mamba-mtp-patch/
 ├── README.md
 ├── commands.md
-├── gold_patch_technical_flow.md
-├── flow_review.md
+├── base.flow
+├── optim.flow
 ├── gold.patch
 ├── test.patch
 └── scripts/
@@ -57,13 +55,41 @@ Use a fresh container for `base`; `serve.sh mamba` and `serve.sh mtp` install
 `gold.patch` into the container's installed vLLM package. The serve scripts do
 not set `preserve_thinking`; vLLM uses the chat-template default for that field.
 
-The production patch includes latest-Mamba prefix-cache support, stable
-latest-minus-one prefill checkpoint publication for chat prompts, matching
-full-attention partial cache reuse, and MTP compatibility. Coarse checkpoints
-are supported but disabled by default. MTP still uses the Eagle proposer path
-where required, but it does not enable Eagle prefix-cache block dropping and
-does not reserve verifier KV lookahead slots. The MTP prefill token reservation
-is active only for MTP with Mamba block-aligned splitting.
+## Mode Overview
+
+`base` is the clean v0.19.1 runtime. It is the correctness and performance
+reference. It uses upstream hybrid prefix-cache behavior and does not install
+any patched files.
+
+`mamba` installs `gold.patch` and serves with latest-Mamba enabled:
+
+```bash
+--mamba-cache-mode latest
+--mamba-latest-tail-checkpoints 0
+--mamba-latest-coarse-checkpoints 0
+--mamba-latest-coarse-min-gap 512
+```
+
+With these defaults, the optimized path is latest-only: no tail checkpoints and
+no coarse checkpoints are intentionally retained. The patch adds smaller
+latest-Mamba prefix hashing, Mamba-anchored partial full-attention cache reuse,
+and stable latest-boundary Mamba checkpoint publication for multi-turn prefill
+reuse.
+
+`mtp` installs the same patched runtime and adds MTP speculative decoding:
+
+```bash
+--speculative-config '{"method":"mtp","num_speculative_tokens":3}'
+```
+
+MTP shares the Eagle-compatible speculative path where vLLM requires it, but it
+does not enable Eagle prefix-cache block dropping and does not reserve Eagle
+verifier KV lookahead slots. MTP uses the latest-Mamba cache flow plus MTP's
+draft/acceptance path, so it must be benchmarked separately from non-MTP
+`mamba`.
+
+See `base.flow` and `optim.flow` for the current technical flow. Those docs are
+the source of truth for the base versus patched cache contracts.
 
 Local verification run:
 
@@ -93,6 +119,13 @@ Local verification run:
   The previously bad turn-6/7 fallback to `cached=2224` was fixed; the clean
   probe reported turn-6 `cached=2832 prefill=626` and turn-7
   `cached=3440 prefill=629`.
+- SWEAgent-style 4-way comparison, Qwen3.5 35B, TP=2, expert parallel,
+  `max_num_batched_tokens=16384`: base resolved 3/4 with 838.0 prefill/request
+  and 183.1 generated/request; mamba resolved 2/4 with 393.6 prefill/request
+  and 126.6 generated/request; mtp resolved 2/4 with 1204.3 prefill/request
+  and 161.5 generated/request. This run shows why generated tokens/request,
+  resolved count, and trajectory inspection are required alongside prefill and
+  TPS metrics.
 
 GPU/container tests and serving benchmarks should be run with the commands in
 `commands.md`.
