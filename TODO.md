@@ -17,6 +17,44 @@ full-attention KV caching can reuse.
 - Start with one final decode checkpoint only; do not add periodic decode
   checkpointing until the single-checkpoint path is measured.
 
+## Alignment Constraint Check
+
+The hybrid cache constraint is that every physical KV block size must be
+divisible by the prefix hash block size:
+
+```text
+kv_cache_group.block_size % hash_block_size == 0
+```
+
+The observed latest-Mamba serve shapes satisfy this:
+
+```text
+non-MTP: attention_block_size=1072, hash_block_size=16, mamba_block_size=16
+MTP:     attention_block_size=1120, hash_block_size=16, mamba_block_size=16
+```
+
+A decode checkpoint stride of 128 tokens is therefore legal because:
+
+```text
+128 % hash_block_size == 0
+128 % mamba_block_size == 0
+```
+
+The 128-token checkpoint boundary does not need to divide the full-attention
+block size. Most such boundaries land inside a full-attention physical block and
+must be represented by a partial full-attention cache entry. Exact full-attention
+block alignment happens only occasionally:
+
+```text
+lcm(1072, 128) = 8576
+lcm(1120, 128) = 4480
+```
+
+Implementation consequence: when a sparse Mamba boundary is selected, explicitly
+publish or retain the full-attention partial cache at that same boundary. Do not
+rely on generic "latest partial" behavior, because a later decode step can move
+the latest partial boundary past the Mamba checkpoint boundary.
+
 ## Correctness Contract
 
 For every published decode checkpoint:
