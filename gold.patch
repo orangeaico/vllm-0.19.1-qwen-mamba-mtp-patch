@@ -1514,7 +1514,7 @@ index fe524ccac..937fa68c2 100644
          logprobs = model_runner_output.logprobs
          prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
-index fa5395685..fbf731c51 100644
+index fa5395685..52b5e6d21 100644
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
 @@ -39,6 +39,7 @@ class SingleTypeKVCacheManager(ABC):
@@ -1621,7 +1621,7 @@ index fa5395685..fbf731c51 100644
      def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
          blocks = self.req_to_blocks[running_request_id]
          num_common_blocks = 0
-@@ -774,12 +824,269 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -774,12 +824,272 @@ class MambaManager(SingleTypeKVCacheManager):
          self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
          self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
          self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
@@ -1860,9 +1860,6 @@ index fa5395685..fbf731c51 100644
 +        if block_idx is None:
 +            return None
 +
-+        if self.current_state_block_idx.get(request_id) != block_idx:
-+            return None
-+
 +        prompt_boundary = (block_idx + 1) * self.block_size
 +        blocks = self.req_to_blocks.get(request_id)
 +        if blocks is None or block_idx >= len(blocks):
@@ -1870,6 +1867,12 @@ index fa5395685..fbf731c51 100644
 +
 +        block = blocks[block_idx]
 +        if block.is_null:
++            return None
++        if (
++            self.current_state_block_idx.get(request_id) != block_idx
++            and block.block_hash is None
++            and block_idx not in self._source_state_indices(request_id)
++        ):
 +            return None
 +
 +        old_latest_idx = self.latest_checkpoint_block_idx.get(request_id)
@@ -1892,7 +1895,7 @@ index fa5395685..fbf731c51 100644
  
      @classmethod
      def find_longest_cache_hit(
-@@ -839,8 +1146,26 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -839,8 +1149,26 @@ class MambaManager(SingleTypeKVCacheManager):
          # that we might actually need.
          num_computed_tokens = max(0, num_computed_tokens - self.num_speculative_blocks)
  
@@ -1920,7 +1923,7 @@ index fa5395685..fbf731c51 100644
              # `last_state_block_idx` refers to the block index allocated two steps ago.
              # The block allocated in the previous step is used to copy Mamba states
              # into the block allocated in the current step; the earlier block is
-@@ -854,10 +1179,9 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -854,10 +1182,9 @@ class MambaManager(SingleTypeKVCacheManager):
                  and last_state_block_idx
                  < cdiv(num_computed_tokens, self.block_size) - 1
              ):
@@ -1934,7 +1937,7 @@ index fa5395685..fbf731c51 100644
  
      def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
          """
-@@ -883,7 +1207,7 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -883,7 +1210,7 @@ class MambaManager(SingleTypeKVCacheManager):
              # that kv_cache_manager will think there is no enough blocks to allocate now
              # and don't schedule it in the current step.
              return self.block_pool.num_gpu_blocks + 1
@@ -1943,7 +1946,7 @@ index fa5395685..fbf731c51 100644
              # Allocate extra `num_speculative_blocks` blocks for
              # speculative decoding (MTP/EAGLE) with linear attention.
              if self.num_speculative_blocks > 0:
-@@ -910,6 +1234,29 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -910,6 +1237,29 @@ class MambaManager(SingleTypeKVCacheManager):
              num_required_blocks = (
                  cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
              )
@@ -1973,7 +1976,7 @@ index fa5395685..fbf731c51 100644
              num_new_blocks = (
                  num_required_blocks
                  - len(new_computed_blocks)
-@@ -930,11 +1277,78 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -930,11 +1280,78 @@ class MambaManager(SingleTypeKVCacheManager):
              )
              return num_new_blocks + num_evictable_computed_blocks
  
@@ -2053,7 +2056,7 @@ index fa5395685..fbf731c51 100644
              # Allocate extra `num_speculative_blocks` blocks for
              # speculative decoding (MTP/EAGLE) with linear attention.
              if self.num_speculative_blocks > 0:
-@@ -949,6 +1363,10 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -949,6 +1366,10 @@ class MambaManager(SingleTypeKVCacheManager):
              # We can ignore lookahead tokens because current draft models don't have
              # mamba layers.
              num_tokens = num_tokens_main_model
@@ -2064,7 +2067,7 @@ index fa5395685..fbf731c51 100644
              req_blocks: list[KVCacheBlock] = self.req_to_blocks[request_id]
              # NOTE(tdouble): this is an over-estimate of how many blocks we need because
              # num_tokens can include draft tokens that will later be rejected.
-@@ -968,13 +1386,14 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -968,13 +1389,14 @@ class MambaManager(SingleTypeKVCacheManager):
                  if blocks_allocated:
                      # We always save the running state at the last
                      # (1 + num_speculative_blocks) block
@@ -2081,7 +2084,7 @@ index fa5395685..fbf731c51 100644
  
                  num_skipped_blocks = (
                      num_required_blocks - self.num_speculative_blocks - 1
-@@ -1005,13 +1424,22 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1005,13 +1427,22 @@ class MambaManager(SingleTypeKVCacheManager):
                      assert num_new_blocks <= self.num_speculative_blocks + 1
                  new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
                  req_blocks.extend(new_blocks)
@@ -2105,7 +2108,7 @@ index fa5395685..fbf731c51 100644
          super().free(request_id)
  
      def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
-@@ -1023,6 +1451,24 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1023,6 +1454,24 @@ class MambaManager(SingleTypeKVCacheManager):
          return num_computed_tokens - 1
  
      def cache_blocks(self, request: Request, num_tokens: int) -> None:
@@ -2130,7 +2133,7 @@ index fa5395685..fbf731c51 100644
          num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
          super().cache_blocks(request, num_tokens)
          num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
-@@ -1035,8 +1481,79 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1035,8 +1484,79 @@ class MambaManager(SingleTypeKVCacheManager):
                  assert block.block_hash is not None
                  self.cached_blocks_this_step.add(block.block_hash)
  
@@ -2210,7 +2213,7 @@ index fa5395685..fbf731c51 100644
  
  
  class CrossAttentionManager(SingleTypeKVCacheManager):
-@@ -1097,6 +1614,7 @@ class SinkFullAttentionManager(FullAttentionManager):
+@@ -1097,6 +1617,7 @@ class SinkFullAttentionManager(FullAttentionManager):
          kv_cache_group_id: int,
          dcp_world_size: int = 1,
          pcp_world_size: int = 1,
@@ -2218,7 +2221,7 @@ index fa5395685..fbf731c51 100644
      ):
          super().__init__(
              kv_cache_spec,
-@@ -1105,6 +1623,7 @@ class SinkFullAttentionManager(FullAttentionManager):
+@@ -1105,6 +1626,7 @@ class SinkFullAttentionManager(FullAttentionManager):
              kv_cache_group_id,
              dcp_world_size,
              pcp_world_size,
