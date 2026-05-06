@@ -9,6 +9,8 @@ Artifacts:
 - `commands.md`: paste-ready reproduction and serve commands.
 - `base.flow`: clean v0.19.1 baseline serving and cache flow.
 - `optim.flow`: patched latest-Mamba and MTP serving, cache, and review flow.
+- `results/swe4_comparison_20260506.csv`: four-row SWEAgent comparison with
+  base, latest-Mamba, latest-Mamba+MTP, and v0.19.0 MTP-only patch results.
 - `scripts/run_tests.sh`: run inside a clean vLLM serve container after
   cloning this artifact repo; applies both patches and validates tests.
 - `scripts/serve.sh`: run inside a clean vLLM serve container after cloning
@@ -27,6 +29,8 @@ vllm-0.19.1-qwen-mamba-mtp-patch/
 ├── optim.flow
 ├── gold.patch
 ├── test.patch
+├── results/
+│   └── swe4_comparison_20260506.csv
 └── scripts/
     ├── debug/
     ├── debug.sh
