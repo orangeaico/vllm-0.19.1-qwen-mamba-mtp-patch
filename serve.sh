@@ -5,13 +5,9 @@ BASE_COMMIT="b1388b1fbf5aaef47937fabe98931211684666a6"
 VLLM_REPO_URL="${VLLM_REPO_URL:-https://github.com/vllm-project/vllm.git}"
 PATCH_SRC_DIR="${PATCH_SRC_DIR:-/workspace/vllm-runtime-patch}"
 SITE_PACKAGES="${SITE_PACKAGES:-/usr/local/lib/python3.12/dist-packages}"
-MODEL_PATH="${MODEL_PATH:-/home/shared/megatron_dir/hf_models/Qwen3.5-35B-A3B-FP8/}"
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-3003}"
-TP="${TP:-2}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
 PRESERVE_THINKING="${PRESERVE_THINKING:-false}"
 VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS="${VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:-1}"
 export VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
@@ -19,7 +15,14 @@ export VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
 usage() {
   cat >&2 <<'USAGE'
 Usage:
+  bash serve.sh <remote|local> <base|mamba|mtp>
   bash serve.sh <base|mamba|mtp>
+
+Profiles:
+  remote Use the main-branch serve shape: HF Qwen3.6 model, no TP/EP flags,
+         max_num_batched_tokens=32768.
+  local  Use the local fit-safe shape used during validation: /home/shared
+         Qwen3.5 model, TP=2, expert parallel, max_num_batched_tokens=16384.
 
 Modes:
   base   Serve the installed vLLM image without applying gold.patch.
@@ -27,8 +30,8 @@ Modes:
   mtp    Apply gold.patch, then serve align cache mode plus 3-token MTP.
 
 Environment knobs:
-  MODEL_PATH, SERVED_MODEL_NAME, HOST, PORT, TP, GPU_MEMORY_UTILIZATION,
-  MAX_NUM_BATCHED_TOKENS, PRESERVE_THINKING,
+  MODEL_PATH, SERVED_MODEL_NAME, HOST, PORT, TP, ENABLE_EXPERT_PARALLEL,
+  GPU_MEMORY_UTILIZATION, MAX_NUM_BATCHED_TOKENS, PRESERVE_THINKING,
   VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS.
 
 Prompt-tail caching is targeted at preserve_thinking=false. The default here is
@@ -38,12 +41,26 @@ cache before graph capture.
 USAGE
 }
 
-if [[ $# -ne 1 ]]; then
+if [[ $# -eq 1 ]]; then
+  PROFILE="${SERVE_PROFILE:-local}"
+  MODE="$1"
+elif [[ $# -eq 2 ]]; then
+  PROFILE="$1"
+  MODE="$2"
+else
   usage
   exit 2
 fi
 
-MODE="$1"
+case "$PROFILE" in
+  remote|local) ;;
+  *)
+    echo "Unknown profile: $PROFILE" >&2
+    usage
+    exit 2
+    ;;
+esac
+
 case "$MODE" in
   base|mamba|mtp) ;;
   *)
@@ -54,6 +71,20 @@ esac
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 GOLD_PATCH="${SCRIPT_DIR}/gold.patch"
+
+if [[ "$PROFILE" == "remote" ]]; then
+  MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.6-35B-A3B-FP8}"
+  SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3}"
+  MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-32768}"
+  TP="${TP:-}"
+  ENABLE_EXPERT_PARALLEL="${ENABLE_EXPERT_PARALLEL:-0}"
+else
+  MODEL_PATH="${MODEL_PATH:-/home/shared/megatron_dir/hf_models/Qwen3.5-35B-A3B-FP8/}"
+  SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3}"
+  MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
+  TP="${TP:-2}"
+  ENABLE_EXPERT_PARALLEL="${ENABLE_EXPERT_PARALLEL:-1}"
+fi
 
 install_patch() {
   [[ -f "$GOLD_PATCH" ]] || {
@@ -98,8 +129,6 @@ cmd=(
   --host "$HOST"
   --port "$PORT"
   --served-model-name "$SERVED_MODEL_NAME"
-  --tensor-parallel-size "$TP"
-  --enable-expert-parallel
   --max-model-len 65536
   --kv-cache-dtype fp8
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
@@ -117,6 +146,14 @@ cmd=(
   --no-scheduler-reserve-full-isl
 )
 
+if [[ -n "$TP" ]]; then
+  cmd+=(--tensor-parallel-size "$TP")
+fi
+
+if [[ "$ENABLE_EXPERT_PARALLEL" == "1" || "$ENABLE_EXPERT_PARALLEL" == "true" ]]; then
+  cmd+=(--enable-expert-parallel)
+fi
+
 if [[ "$MODE" == "mamba" || "$MODE" == "mtp" ]]; then
   cmd+=(--mamba-cache-mode align)
 fi
@@ -125,6 +162,7 @@ if [[ "$MODE" == "mtp" ]]; then
   cmd+=(--speculative-config '{"method":"mtp","num_speculative_tokens":3}')
 fi
 
+printf 'Serving profile: %s\n' "$PROFILE"
 printf 'Serving mode: %s\n' "$MODE"
 printf 'Command:'
 printf ' %q' "${cmd[@]}"
