@@ -1,0 +1,340 @@
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index b505999fd..cd216b0e9 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -263,6 +263,17 @@ class OpenAIServingChat(OpenAIServing):
+                 )
+                 stable_len = max(len(prompt_token_ids) - suffix_len, 0)
+                 engine_input["prompt_tail_cache_stable_len"] = stable_len
++                logger.info(
++                    "[prompt-tail-debug] request_id=%s prompt_tokens=%d "
++                    "stable_len=%d suffix_len=%d enable_thinking=%s "
++                    "preserve_thinking=%s",
++                    request_id,
++                    len(prompt_token_ids),
++                    stable_len,
++                    suffix_len,
++                    chat_template_kwargs.get("enable_thinking"),
++                    chat_template_kwargs.get("preserve_thinking"),
++                )
+
+             # If we are creating sub requests for multiple prompts, ensure that they
+             # have unique request ids.
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 85f8141e6..a3452f9fb 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -213,6 +213,18 @@ class KVCacheManager:
+         if prompt_tail_boundary is not None:
+             request.prompt_tail_cache_current_boundary = prompt_tail_boundary
+             prompt_tail_hashes = self._prompt_tail_hashes(request)
++            logger.info(
++                "[prompt-tail-debug] lookup req=%s prompt_tokens=%d "
++                "num_tokens=%d stable_len=%s boundary=%d candidates=%d "
++                "index_size=%d",
++                request.request_id,
++                request.num_prompt_tokens,
++                request.num_tokens,
++                request.prompt_tail_cache_stable_len,
++                prompt_tail_boundary,
++                len(prompt_tail_hashes),
++                len(self._prompt_tail_boundary_by_hash),
++            )
+             for block_idx in range(len(prompt_tail_hashes) - 1, -1, -1):
+                 block_hash = prompt_tail_hashes[block_idx]
+                 previous_boundary = (
+@@ -223,6 +235,12 @@ class KVCacheManager:
+                     != previous_boundary
+                 ):
+                     continue
++                logger.info(
++                    "[prompt-tail-debug] probe req=%s boundary=%d block_idx=%d",
++                    request.request_id,
++                    previous_boundary,
++                    block_idx,
++                )
+                 computed_blocks, num_new_computed_tokens = (
+                     self.coordinator.find_prompt_tail_cache_hit(
+                         request, previous_boundary, block_hash
+@@ -247,7 +265,21 @@ class KVCacheManager:
+                         self.create_kv_cache_blocks(computed_blocks),
+                         num_new_computed_tokens,
+                     )
++                logger.info(
++                    "[prompt-tail-debug] stale req=%s boundary=%d "
++                    "computed_tokens=%d partial_hits=%d mamba_hit=%s",
++                    request.request_id,
++                    previous_boundary,
++                    num_new_computed_tokens,
++                    len(partial_hits),
++                    mamba_hit is not None,
++                )
+                 self._prompt_tail_boundary_by_hash.pop(block_hash, None)
++            logger.info(
++                "[prompt-tail-debug] miss req=%s boundary=%d",
++                request.request_id,
++                prompt_tail_boundary,
++            )
+             self._pending_partial_hits.pop(request.request_id, None)
+             self._pending_mamba_prompt_hits.pop(request.request_id, None)
+
+@@ -507,6 +539,16 @@ class KVCacheManager:
+             num_blocks_to_allocate += (
+                 self.coordinator.get_num_prompt_tail_cache_blocks()
+             )
++            logger.info(
++                "[prompt-tail-debug] reserve-publish req=%s total=%d new=%d "
++                "boundary=%d need_blocks=%d free_blocks=%d",
++                request.request_id,
++                total_computed_tokens,
++                num_new_tokens,
++                prompt_tail_boundary,
++                num_blocks_to_allocate,
++                self.block_pool.get_num_free_blocks(),
++            )
+
+         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+             # Cannot allocate new blocks
+@@ -576,6 +618,13 @@ class KVCacheManager:
+             prompt_tail_hashes = self._prompt_tail_hashes(request)
+             if prompt_tail_hashes:
+                 block_hash = prompt_tail_hashes[-1]
++                logger.info(
++                    "[prompt-tail-debug] publish-attempt req=%s boundary=%d "
++                    "num_tokens_to_cache=%d",
++                    request.request_id,
++                    prompt_tail_boundary,
++                    num_tokens_to_cache,
++                )
+                 copy = self.coordinator.make_prompt_tail_cache_copy(
+                     request, block_hash, prompt_tail_boundary
+                 )
+@@ -585,6 +634,21 @@ class KVCacheManager:
+                     self._prompt_tail_boundary_by_hash[block_hash] = (
+                         prompt_tail_boundary
+                     )
++                    logger.info(
++                        "[prompt-tail-debug] publish-ok req=%s boundary=%d "
++                        "src_block_idx=%d dst_blocks=%s index_size=%d",
++                        request.request_id,
++                        prompt_tail_boundary,
++                        copy.src_block_idx,
++                        copy.dst_block_ids,
++                        len(self._prompt_tail_boundary_by_hash),
++                    )
++                else:
++                    logger.info(
++                        "[prompt-tail-debug] publish-fail req=%s boundary=%d",
++                        request.request_id,
++                        prompt_tail_boundary,
++                    )
+
+         return self.create_kv_cache_blocks(new_blocks)
+
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 4de41b373..15147c890 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -5,6 +5,7 @@ from collections.abc import Sequence
+ from dataclasses import dataclass
+ from math import lcm
+
++from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv
+ from vllm.v1.core.block_pool import BlockPool
+ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+@@ -31,6 +32,8 @@ from vllm.v1.kv_cache_interface import (
+ )
+ from vllm.v1.request import Request
+
++logger = init_logger(__name__)
++
+
+ @dataclass(frozen=True, slots=True)
+ class PartialKVCacheHit:
+@@ -697,11 +700,25 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+         self._last_mamba_prompt_hit = None
+         groups = self._prompt_tail_groups()
+         if groups is None or boundary <= 0:
++            logger.info(
++                "[prompt-tail-debug] coordinator-hit-skip req=%s "
++                "boundary=%d groups=%s",
++                request.request_id,
++                boundary,
++                groups is not None,
++            )
+             return tuple([] for _ in self.single_type_managers), 0
+
+         (full_spec, full_group_ids), (mamba_spec, mamba_group_ids) = groups
+         mamba_blocks = self.block_pool.get_cached_block(block_hash, mamba_group_ids)
+         if mamba_blocks is None:
++            logger.info(
++                "[prompt-tail-debug] coordinator-miss-mamba req=%s boundary=%d "
++                "mamba_block_size=%d",
++                request.request_id,
++                boundary,
++                mamba_spec.block_size,
++            )
+             return tuple([] for _ in self.single_type_managers), 0
+
+         full_block_idx = boundary // full_spec.block_size
+@@ -712,8 +729,24 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+                 block_hash, full_group_ids
+             )
+             if partial_blocks is None:
++                logger.info(
++                    "[prompt-tail-debug] coordinator-miss-partial-full "
++                    "req=%s boundary=%d full_block_idx=%d valid=%d",
++                    request.request_id,
++                    boundary,
++                    full_block_idx,
++                    full_valid_tokens,
++                )
+                 return tuple([] for _ in self.single_type_managers), 0
+             if partial_blocks[0].valid_tokens < full_valid_tokens:
++                logger.info(
++                    "[prompt-tail-debug] coordinator-miss-partial-short "
++                    "req=%s boundary=%d have=%d need=%d",
++                    request.request_id,
++                    boundary,
++                    partial_blocks[0].valid_tokens,
++                    full_valid_tokens,
++                )
+                 return tuple([] for _ in self.single_type_managers), 0
+             for group_id, partial_block in zip(full_group_ids, partial_blocks):
+                 partial_hits.append(
+@@ -735,6 +768,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+                 full_hashes[full_block_idx - 1], full_group_ids
+             )
+             if full_blocks is None:
++                logger.info(
++                    "[prompt-tail-debug] coordinator-miss-full-block "
++                    "req=%s boundary=%d full_block_idx=%d",
++                    request.request_id,
++                    boundary,
++                    full_block_idx,
++                )
+                 return tuple([] for _ in self.single_type_managers), 0
+             full_blocks_by_group = {
+                 group_id: [block]
+@@ -743,6 +783,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+
+         mamba_state_idx = cdiv(boundary, mamba_spec.block_size) - 1
+         if mamba_state_idx < 0:
++            logger.info(
++                "[prompt-tail-debug] coordinator-miss-bad-mamba-idx "
++                "req=%s boundary=%d mamba_block_size=%d",
++                request.request_id,
++                boundary,
++                mamba_spec.block_size,
++            )
+             return tuple([] for _ in self.single_type_managers), 0
+
+         num_groups = len(self.kv_cache_config.kv_cache_groups)
+@@ -759,6 +806,17 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+             src_blocks=tuple(mamba_blocks),
+             dst_block_idx=mamba_state_idx,
+         )
++        logger.info(
++            "[prompt-tail-debug] coordinator-hit req=%s boundary=%d "
++            "full_block_idx=%d full_valid=%d mamba_state_idx=%d "
++            "partial_hits=%d",
++            request.request_id,
++            boundary,
++            full_block_idx,
++            full_valid_tokens,
++            mamba_state_idx,
++            len(partial_hits),
++        )
+         return tuple(hit_blocks_by_group), boundary
+
+     def make_prompt_tail_cache_copy(
+@@ -766,6 +824,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+     ) -> MambaPromptCacheCopy | None:
+         groups = self._prompt_tail_groups()
+         if groups is None or boundary <= 0:
++            logger.info(
++                "[prompt-tail-debug] coordinator-copy-skip req=%s "
++                "boundary=%d groups=%s",
++                request.request_id,
++                boundary,
++                groups is not None,
++            )
+             return None
+
+         (full_spec, full_group_ids), (mamba_spec, mamba_group_ids) = groups
+@@ -776,9 +841,25 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+                 manager = self.single_type_managers[group_id]
+                 req_blocks = manager.req_to_blocks.get(request.request_id)
+                 if req_blocks is None or full_block_idx >= len(req_blocks):
++                    logger.info(
++                        "[prompt-tail-debug] coordinator-copy-fail-full-missing "
++                        "req=%s boundary=%d group=%d full_block_idx=%d",
++                        request.request_id,
++                        boundary,
++                        group_id,
++                        full_block_idx,
++                    )
+                     return None
+                 src_block = req_blocks[full_block_idx]
+                 if src_block.is_null:
++                    logger.info(
++                        "[prompt-tail-debug] coordinator-copy-fail-full-null "
++                        "req=%s boundary=%d group=%d full_block_idx=%d",
++                        request.request_id,
++                        boundary,
++                        group_id,
++                        full_block_idx,
++                    )
+                     return None
+             for group_id in full_group_ids:
+                 manager = self.single_type_managers[group_id]
+@@ -801,6 +882,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+                         )
+                     ]
+                 )
++                logger.info(
++                    "[prompt-tail-debug] coordinator-copy-fail-not-mamba "
++                    "req=%s boundary=%d group=%d",
++                    request.request_id,
++                    boundary,
++                    group_id,
++                )
+                 return None
+             dst_block_id = manager.cache_prompt_tail_state(
+                 request.request_id, block_hash, src_block_idx
+@@ -813,10 +901,34 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+                         )
+                     ]
+                 )
++                logger.info(
++                    "[prompt-tail-debug] coordinator-copy-fail-mamba-cache "
++                    "req=%s boundary=%d group=%d src_block_idx=%d",
++                    request.request_id,
++                    boundary,
++                    group_id,
++                    src_block_idx,
++                )
+                 return None
+             dst_block_ids.append(dst_block_id)
+         if not dst_block_ids:
++            logger.info(
++                "[prompt-tail-debug] coordinator-copy-fail-no-dst "
++                "req=%s boundary=%d",
++                request.request_id,
++                boundary,
++            )
+             return None
++        logger.info(
++            "[prompt-tail-debug] coordinator-copy-ok req=%s boundary=%d "
++            "full_block_idx=%d full_valid=%d mamba_src_idx=%d dst_blocks=%s",
++            request.request_id,
++            boundary,
++            full_block_idx,
++            full_valid_tokens,
++            src_block_idx,
++            tuple(dst_block_ids),
++        )
+         return MambaPromptCacheCopy(
+             req_id=request.request_id,
+             src_block_idx=src_block_idx,
