@@ -16,7 +16,6 @@ usage() {
   cat >&2 <<'USAGE'
 Usage:
   bash serve.sh <remote|local> <base|mamba|mtp>
-  bash serve.sh <base|mamba|mtp>
 
 Profiles:
   remote Use the main-branch serve shape: HF Qwen3.6 model, no TP/EP flags,
@@ -41,16 +40,13 @@ cache before graph capture.
 USAGE
 }
 
-if [[ $# -eq 1 ]]; then
-  PROFILE="${SERVE_PROFILE:-local}"
-  MODE="$1"
-elif [[ $# -eq 2 ]]; then
-  PROFILE="$1"
-  MODE="$2"
-else
+if [[ $# -ne 2 ]]; then
   usage
   exit 2
 fi
+
+PROFILE="$1"
+MODE="$2"
 
 case "$PROFILE" in
   remote|local) ;;
