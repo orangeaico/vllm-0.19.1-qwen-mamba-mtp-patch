@@ -5,7 +5,7 @@ index bb63f6b12..66961d79b 100644
 @@ -859,6 +859,24 @@ class SpeculativeConfig:
      def use_eagle(self) -> bool:
          return self.method in ("eagle", "eagle3", "mtp")
- 
+
 +    def use_eagle_prefix_cache_drop(self) -> bool:
 +        """Whether prefix-cache lookup should drop the last matched block.
 +
@@ -26,7 +26,7 @@ index bb63f6b12..66961d79b 100644
 +
      def uses_draft_model(self) -> bool:
          return self.method == "draft_model"
- 
+
 diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
 index 493c26d3a..b505999fd 100644
 --- a/vllm/entrypoints/openai/chat_completion/serving.py
@@ -62,7 +62,7 @@ index 493c26d3a..b505999fd 100644
 +                )
 +                stable_len = max(len(prompt_token_ids) - suffix_len, 0)
 +                engine_input["prompt_tail_cache_stable_len"] = stable_len
- 
+
              # If we are creating sub requests for multiple prompts, ensure that they
              # have unique request ids.
 diff --git a/vllm/inputs/engine.py b/vllm/inputs/engine.py
@@ -72,11 +72,11 @@ index 2b426eba8..424195632 100644
 @@ -25,6 +25,9 @@ class _InputOptions(TypedDict):
      cache_salt: NotRequired[str]
      """Optional cache salt to be used for prefix caching."""
- 
+
 +    prompt_tail_cache_stable_len: NotRequired[int]
 +    """Stable prompt prefix length eligible for prompt-tail caching."""
 +
- 
+
  class TokensInput(_InputOptions):
      """Represents token-based input to the engine."""
 diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
@@ -89,12 +89,12 @@ index 4b62d2a4c..97b40f2c6 100644
  from collections.abc import Iterable, Sequence
 +from dataclasses import dataclass
  from typing import Any
- 
+
  from vllm.distributed.kv_events import (
 @@ -30,6 +31,14 @@ from vllm.v1.request import Request
  logger = init_logger(__name__)
- 
- 
+
+
 +@dataclass(slots=True)
 +class PartialKVCacheBlock:
 +    """A cached prefix ending inside a physical KV cache block."""
@@ -107,20 +107,20 @@ index 4b62d2a4c..97b40f2c6 100644
      """
      Cache of blocks that are used for prefix caching. It caches blocks
 @@ -168,6 +177,10 @@ class BlockPool:
- 
+
          # Cache for block lookup
          self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
 +        self.cached_partial_block_hash_to_block: dict[
 +            BlockHashWithGroupId, PartialKVCacheBlock
 +        ] = {}
 +        self.partial_block_id_to_hashes: dict[int, set[BlockHashWithGroupId]] = {}
- 
+
          # To represent a placeholder block with block_id=0.
          # The ref_cnt of null_block is not maintained, needs special care to
 @@ -207,6 +220,75 @@ class BlockPool:
              cached_blocks.append(block)
          return cached_blocks
- 
+
 +    def get_cached_partial_block(
 +        self, block_hash: BlockHash, kv_cache_group_ids: list[int]
 +    ) -> list[PartialKVCacheBlock] | None:
@@ -199,13 +199,13 @@ index 4b62d2a4c..97b40f2c6 100644
              # The block doesn't have hash, eviction is not needed
 +            self._evict_cached_partial_blocks(block)
              return False
- 
+
          if self.cached_block_hash_to_block.pop(block_hash, block.block_id) is None:
              # block not found in cached_block_hash_to_block,
              # eviction is not needed
 +            self._evict_cached_partial_blocks(block)
              return False
- 
+
          block.reset_hash()
 @@ -387,8 +471,16 @@ class BlockPool:
                      medium=MEDIUM_GPU,
@@ -213,7 +213,7 @@ index 4b62d2a4c..97b40f2c6 100644
              )
 +        self._evict_cached_partial_blocks(block)
          return True
- 
+
 +    def _evict_cached_partial_blocks(self, block: KVCacheBlock) -> None:
 +        partial_hashes = self.partial_block_id_to_hashes.pop(block.block_id, None)
 +        if partial_hashes is None:
@@ -225,12 +225,12 @@ index 4b62d2a4c..97b40f2c6 100644
          """Touch a block increases its reference count by 1, and may remove
          the block from the free queue. This is used when a block is hit by
 @@ -461,6 +553,8 @@ class BlockPool:
- 
+
          # Remove all hashes so that no new blocks will hit.
          self.cached_block_hash_to_block = BlockHashToBlockMap()
 +        self.cached_partial_block_hash_to_block = {}
 +        self.partial_block_id_to_hashes = {}
- 
+
          # Remove all hashes from all blocks.
          for block in self.blocks:
 diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
@@ -243,7 +243,7 @@ index eaa95dfe4..4de41b373 100644
  from collections.abc import Sequence
 +from dataclasses import dataclass
  from math import lcm
- 
+
 +from vllm.utils.math_utils import cdiv
  from vllm.v1.core.block_pool import BlockPool
  from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
@@ -269,8 +269,8 @@ index eaa95dfe4..4de41b373 100644
 +    MambaSpec,
  )
  from vllm.v1.request import Request
- 
- 
+
+
 +@dataclass(frozen=True, slots=True)
 +class PartialKVCacheHit:
 +    kv_cache_group_id: int
@@ -294,13 +294,13 @@ index eaa95dfe4..4de41b373 100644
          self.enable_caching = enable_caching
 +        self._last_partial_hits: list[PartialKVCacheHit] = []
 +        self._last_mamba_prompt_hit: MambaPromptCacheHit | None = None
- 
+
          self.block_pool = BlockPool(
              kv_cache_config.num_blocks,
 @@ -114,6 +137,45 @@ class KVCacheCoordinator(ABC):
                  )
          return num_blocks_to_allocate
- 
+
 +    def get_num_blocks_to_touch(
 +        self, partial_hits: Sequence[PartialKVCacheHit]
 +    ) -> int:
@@ -346,7 +346,7 @@ index eaa95dfe4..4de41b373 100644
 @@ -140,6 +202,39 @@ class KVCacheCoordinator(ABC):
                  num_external_computed_tokens,
              )
- 
+
 +    def make_partial_cache_copy_ops(
 +        self, request_id: str, partial_hits: Sequence[PartialKVCacheHit]
 +    ) -> list[KVCacheBlockCopy]:
@@ -386,7 +386,7 @@ index eaa95dfe4..4de41b373 100644
 @@ -188,6 +283,44 @@ class KVCacheCoordinator(ABC):
          for manager in self.single_type_managers:
              manager.cache_blocks(request, num_computed_tokens)
- 
+
 +    def make_prompt_tail_cache_copy(
 +        self, request: Request, block_hash: BlockHash, boundary: int
 +    ) -> MambaPromptCacheCopy | None:
@@ -431,7 +431,7 @@ index eaa95dfe4..4de41b373 100644
 @@ -543,6 +676,173 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
              blocks if blocks is not None else [] for blocks in hit_blocks_by_group
          ), hit_length
- 
+
 +    def _prompt_tail_groups(
 +        self,
 +    ) -> tuple[tuple[FullAttentionSpec, list[int]], tuple[MambaSpec, list[int]]] | None:
@@ -599,23 +599,23 @@ index eaa95dfe4..4de41b373 100644
 +                if isinstance(manager, MambaManager):
 +                    manager.release_prompt_tail_cache_block(block_id)
 +
- 
+
  def get_kv_cache_coordinator(
      kv_cache_config: KVCacheConfig,
 diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
-index dcec5e05b..2114e014b 100644
+index dcec5e05b..85f8141e6 100644
 --- a/vllm/v1/core/kv_cache_manager.py
 +++ b/vllm/v1/core/kv_cache_manager.py
 @@ -1,6 +1,7 @@
  # SPDX-License-Identifier: Apache-2.0
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
- 
+
 +import hashlib
  import itertools
  from collections.abc import Sequence
  from dataclasses import dataclass
-@@ -8,9 +9,19 @@ from typing import Literal, overload
- 
+@@ -8,12 +9,22 @@ from typing import Literal, overload
+
  from vllm.distributed.kv_events import KVCacheEvent
  from vllm.logger import init_logger
 -from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
@@ -635,7 +635,11 @@ index dcec5e05b..2114e014b 100644
 +)
  from vllm.v1.kv_cache_interface import KVCacheConfig
  from vllm.v1.metrics.stats import PrefixCacheStats
- from vllm.v1.request import Request
+-from vllm.v1.request import Request
++from vllm.v1.request import PROMPT_TAIL_CACHE_GRANULARITY, Request
+
+ logger = init_logger(__name__)
+
 @@ -151,6 +162,12 @@ class KVCacheManager:
          self.empty_kv_cache_blocks = KVCacheBlocks(
              tuple(() for _ in range(self.num_kv_cache_groups))
@@ -645,28 +649,28 @@ index dcec5e05b..2114e014b 100644
 +        self._kv_cache_block_copy_ops: list[KVCacheBlockCopy] = []
 +        self._mamba_prompt_cache_restores: list[MambaPromptCacheRestore] = []
 +        self._mamba_prompt_cache_copies: list[MambaPromptCacheCopy] = []
-+        self._prompt_tail_boundary_by_key: dict[str, int] = {}
- 
++        self._prompt_tail_boundary_by_hash: dict[BlockHash, int] = {}
+
      @property
      def usage(self) -> float:
-@@ -192,6 +209,47 @@ class KVCacheManager:
+@@ -192,6 +209,48 @@ class KVCacheManager:
          if not self.enable_caching or request.skip_reading_prefix_cache:
              return self.empty_kv_cache_blocks, 0
- 
+
 +        prompt_tail_boundary = request.prompt_tail_cache_boundary
 +        if prompt_tail_boundary is not None:
 +            request.prompt_tail_cache_current_boundary = prompt_tail_boundary
-+            prompt_tail_key = self._prompt_tail_cache_key(request)
-+            previous_boundary = (
-+                self._prompt_tail_boundary_by_key.get(prompt_tail_key)
-+                if prompt_tail_key is not None
-+                else None
-+            )
-+            if (
-+                previous_boundary is not None
-+                and 0 < previous_boundary <= prompt_tail_boundary
-+            ):
-+                block_hash = self._prompt_tail_hash(request, previous_boundary)
++            prompt_tail_hashes = self._prompt_tail_hashes(request)
++            for block_idx in range(len(prompt_tail_hashes) - 1, -1, -1):
++                block_hash = prompt_tail_hashes[block_idx]
++                previous_boundary = (
++                    block_idx + 1
++                ) * PROMPT_TAIL_CACHE_GRANULARITY
++                if (
++                    self._prompt_tail_boundary_by_hash.get(block_hash)
++                    != previous_boundary
++                ):
++                    continue
 +                computed_blocks, num_new_computed_tokens = (
 +                    self.coordinator.find_prompt_tail_cache_hit(
 +                        request, previous_boundary, block_hash
@@ -691,35 +695,53 @@ index dcec5e05b..2114e014b 100644
 +                        self.create_kv_cache_blocks(computed_blocks),
 +                        num_new_computed_tokens,
 +                    )
++                self._prompt_tail_boundary_by_hash.pop(block_hash, None)
 +            self._pending_partial_hits.pop(request.request_id, None)
 +            self._pending_mamba_prompt_hits.pop(request.request_id, None)
 +
          # NOTE: When all tokens hit the cache, we must recompute the last token
          # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
          # This can trigger recomputation of an entire block, rather than just
-@@ -215,6 +273,21 @@ class KVCacheManager:
- 
+@@ -215,6 +274,38 @@ class KVCacheManager:
+
          return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
- 
+
 +    @staticmethod
-+    def _prompt_tail_cache_key(request: Request) -> str | None:
-+        return request.cache_salt
-+
-+    @staticmethod
-+    def _prompt_tail_hash(request: Request, boundary: int) -> BlockHash:
-+        token_ids = request.all_token_ids[:boundary]
++    def _hash_prompt_tail_block(
++        parent_block_hash: BlockHash | None,
++        block_token_ids: Sequence[int],
++        cache_salt: str | None,
++    ) -> BlockHash:
 +        payload = (
-+            b"vllm-qwen-prompt-tail-v1",
-+            request.cache_salt,
-+            boundary,
-+            tuple(token_ids),
++            b"vllm-qwen-prompt-tail-v2",
++            parent_block_hash,
++            tuple(block_token_ids),
++            cache_salt,
 +        )
 +        return BlockHash(hashlib.sha256(repr(payload).encode()).digest())
++
++    def _prompt_tail_hashes(self, request: Request) -> list[BlockHash]:
++        prompt_tail_boundary = request.prompt_tail_cache_boundary
++        if prompt_tail_boundary is None:
++            return []
++        parent_block_hash: BlockHash | None = None
++        block_hashes: list[BlockHash] = []
++        for start_idx in range(
++            0, prompt_tail_boundary, PROMPT_TAIL_CACHE_GRANULARITY
++        ):
++            end_idx = start_idx + PROMPT_TAIL_CACHE_GRANULARITY
++            parent_block_hash = self._hash_prompt_tail_block(
++                parent_block_hash,
++                request.all_token_ids[start_idx:end_idx],
++                request.cache_salt,
++            )
++            block_hashes.append(parent_block_hash)
++        return block_hashes
 +
      def can_fit_full_sequence(
          self,
          request: Request,
-@@ -251,6 +324,21 @@ class KVCacheManager:
+@@ -251,6 +342,21 @@ class KVCacheManager:
              total_computed_tokens=total_computed_tokens,
              num_tokens_main_model=full_num_tokens,
          )
@@ -738,10 +760,10 @@ index dcec5e05b..2114e014b 100644
 +            num_blocks_to_allocate += (
 +                self.coordinator.get_num_prompt_tail_cache_blocks()
 +            )
- 
+
          return num_blocks_to_allocate <= self.block_pool.get_num_free_blocks()
- 
-@@ -383,6 +471,24 @@ class KVCacheManager:
+
+@@ -383,6 +489,24 @@ class KVCacheManager:
              + num_external_computed_tokens,
              num_tokens_main_model=num_tokens_main_model,
          )
@@ -763,10 +785,10 @@ index dcec5e05b..2114e014b 100644
 +            num_blocks_to_allocate += (
 +                self.coordinator.get_num_prompt_tail_cache_blocks()
 +            )
- 
+
          if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
              # Cannot allocate new blocks
-@@ -400,6 +506,12 @@ class KVCacheManager:
+@@ -400,6 +524,12 @@ class KVCacheManager:
                  num_local_computed_tokens=num_local_computed_tokens,
                  num_external_computed_tokens=num_external_computed_tokens,
              )
@@ -776,10 +798,10 @@ index dcec5e05b..2114e014b 100644
 +            )
 +        if mamba_hit is not None:
 +            self.coordinator.pin_mamba_prompt_cache_hit(mamba_hit)
- 
+
          new_blocks = self.coordinator.allocate_new_blocks(
              request.request_id,
-@@ -423,6 +535,38 @@ class KVCacheManager:
+@@ -423,6 +553,38 @@ class KVCacheManager:
              request.num_tokens,
          )
          self.coordinator.cache_blocks(request, num_tokens_to_cache)
@@ -803,22 +825,22 @@ index dcec5e05b..2114e014b 100644
 +            and prompt_tail_boundary is not None
 +            and num_tokens_to_cache >= prompt_tail_boundary
 +        ):
-+            block_hash = self._prompt_tail_hash(request, prompt_tail_boundary)
-+            copy = self.coordinator.make_prompt_tail_cache_copy(
-+                request, block_hash, prompt_tail_boundary
-+            )
-+            if copy is not None:
-+                self._mamba_prompt_cache_copies.append(copy)
-+                request.prompt_tail_cache_published = True
-+                prompt_tail_key = self._prompt_tail_cache_key(request)
-+                if prompt_tail_key is not None:
-+                    self._prompt_tail_boundary_by_key[prompt_tail_key] = (
++            prompt_tail_hashes = self._prompt_tail_hashes(request)
++            if prompt_tail_hashes:
++                block_hash = prompt_tail_hashes[-1]
++                copy = self.coordinator.make_prompt_tail_cache_copy(
++                    request, block_hash, prompt_tail_boundary
++                )
++                if copy is not None:
++                    self._mamba_prompt_cache_copies.append(copy)
++                    request.prompt_tail_cache_published = True
++                    self._prompt_tail_boundary_by_hash[block_hash] = (
 +                        prompt_tail_boundary
 +                    )
- 
+
          return self.create_kv_cache_blocks(new_blocks)
- 
-@@ -471,6 +615,12 @@ class KVCacheManager:
+
+@@ -471,6 +633,12 @@ class KVCacheManager:
          if self.log_stats:
              assert self.prefix_cache_stats is not None
              self.prefix_cache_stats.reset = True
@@ -827,14 +849,14 @@ index dcec5e05b..2114e014b 100644
 +        self._kv_cache_block_copy_ops.clear()
 +        self._mamba_prompt_cache_restores.clear()
 +        self._mamba_prompt_cache_copies.clear()
-+        self._prompt_tail_boundary_by_key.clear()
++        self._prompt_tail_boundary_by_hash.clear()
          return True
- 
+
      def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
-@@ -547,6 +697,33 @@ class KVCacheManager:
+@@ -547,6 +715,33 @@ class KVCacheManager:
              ids.extend(mgr.take_new_block_ids())
          return ids
- 
+
 +    def take_kv_cache_block_copy_ops(self) -> list[KVCacheBlockCopy]:
 +        ops = self._kv_cache_block_copy_ops
 +        self._kv_cache_block_copy_ops = []
@@ -871,8 +893,8 @@ index 9ab5af0f6..ba33f7e3a 100644
 +++ b/vllm/v1/core/kv_cache_utils.py
 @@ -155,6 +155,34 @@ class KVCacheBlock:
          )
- 
- 
+
+
 +@dataclass(frozen=True, slots=True)
 +class KVCacheBlockCopy:
 +    """A worker-side KV cache copy between two physical blocks."""
@@ -929,11 +951,11 @@ index bdb97deca..10a6999f9 100644
 +    MambaPromptCacheRestore = object
      SamplingParams = object
      Request = object
- 
+
 @@ -238,6 +246,11 @@ class SchedulerOutput:
      # preventing stale NaN/data from corrupting attention or SSM computation.
      new_block_ids_to_zero: list[int] | None = None
- 
+
 +    # Prompt-tail cache copies scheduled for this step.
 +    kv_cache_block_copy_ops: list[KVCacheBlockCopy] | None = None
 +    mamba_prompt_cache_restores: list[MambaPromptCacheRestore] | None = None
@@ -947,7 +969,7 @@ index fe524ccac..f18848932 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -212,12 +212,19 @@ class Scheduler(SchedulerInterface):
- 
+
          speculative_config = vllm_config.speculative_config
          self.use_eagle = False
 +        self.use_eagle_prefix_cache_drop = False
@@ -966,7 +988,7 @@ index fe524ccac..f18848932 100644
 +                    self.num_lookahead_tokens = self.num_spec_tokens
              if speculative_config.uses_draft_model():
                  self.num_lookahead_tokens = self.num_spec_tokens
- 
+
 @@ -226,7 +233,7 @@ class Scheduler(SchedulerInterface):
              kv_cache_config=kv_cache_config,
              max_model_len=self.max_model_len,
@@ -1016,7 +1038,7 @@ index fe524ccac..f18848932 100644
 @@ -345,6 +366,23 @@ class Scheduler(SchedulerInterface):
                  pass
          return num_new_tokens
- 
+
 +    def _mtp_waiting_prefill_token_reserve(self, token_budget: int) -> int:
 +        if not self.use_mtp_prefill_budget_reservation:
 +            return 0
@@ -1045,17 +1067,17 @@ index fe524ccac..f18848932 100644
 +            token_budget
 +        )
 +        running_token_budget = max(0, token_budget - waiting_prefill_token_reserve)
- 
+
          # Encoder-related.
          scheduled_encoder_inputs: dict[str, list[int]] = {}
 @@ -382,7 +424,7 @@ class Scheduler(SchedulerInterface):
- 
+
          # First, schedule the RUNNING requests.
          req_index = 0
 -        while req_index < len(self.running) and token_budget > 0:
 +        while req_index < len(self.running) and running_token_budget > 0:
              request = self.running[req_index]
- 
+
              if (
 @@ -408,14 +450,13 @@ class Scheduler(SchedulerInterface):
              )
@@ -1063,7 +1085,7 @@ index fe524ccac..f18848932 100644
                  num_new_tokens = self.scheduler_config.long_prefill_token_threshold
 -            num_new_tokens = min(num_new_tokens, token_budget)
 +            num_new_tokens = min(num_new_tokens, token_budget, running_token_budget)
- 
+
              # Make sure the input position does not exceed the max model len.
              # This is necessary when using spec decoding.
              num_new_tokens = min(
@@ -1080,7 +1102,7 @@ index fe524ccac..f18848932 100644
 -                    shift_computed_tokens=1 if self.use_eagle else 0,
 +                    shift_computed_tokens=1 if self.use_eagle_prefix_cache_drop else 0,
                  )
- 
+
              if self.need_mamba_block_aligned_split:
 @@ -481,7 +522,11 @@ class Scheduler(SchedulerInterface):
                          if preempted_req in scheduled_running_reqs:
@@ -1101,7 +1123,7 @@ index fe524ccac..f18848932 100644
              token_budget -= num_new_tokens
 +            running_token_budget -= num_new_tokens
              req_index += 1
- 
+
              # Speculative decode related.
 @@ -692,7 +738,9 @@ class Scheduler(SchedulerInterface):
                              num_computed_tokens,
@@ -1127,7 +1149,7 @@ index fe524ccac..f18848932 100644
 +        mamba_prompt_cache_copies = (
 +            self.kv_cache_manager.take_mamba_prompt_cache_copies() or None
 +        )
- 
+
          scheduler_output = SchedulerOutput(
              scheduled_new_reqs=new_reqs_data,
 @@ -927,6 +984,9 @@ class Scheduler(SchedulerInterface):
@@ -1138,7 +1160,7 @@ index fe524ccac..f18848932 100644
 +            mamba_prompt_cache_restores=mamba_prompt_cache_restores,
 +            mamba_prompt_cache_copies=mamba_prompt_cache_copies,
          )
- 
+
          # NOTE(Kuntai): this function is designed for multiple purposes:
 @@ -1312,6 +1372,12 @@ class Scheduler(SchedulerInterface):
          num_nans_in_logits = model_runner_output.num_nans_in_logits
@@ -1150,7 +1172,7 @@ index fe524ccac..f18848932 100644
 +        self.kv_cache_manager.release_mamba_prompt_cache_restores(
 +            scheduler_output.mamba_prompt_cache_restores
 +        )
- 
+
          perf_stats: PerfStats | None = None
          if self.perf_metrics and self.perf_metrics.is_enabled():
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
@@ -1168,7 +1190,7 @@ index fa5395685..d7e04e1ce 100644
 @@ -212,6 +213,14 @@ class SingleTypeKVCacheManager(ABC):
              if type(self.kv_cache_spec) is FullAttentionSpec:
                  self.new_block_ids.extend(b.block_id for b in allocated_blocks)
- 
+
 +    def pin_blocks(
 +        self, request_id: str, blocks: Sequence[KVCacheBlock]
 +    ) -> None:
@@ -1183,7 +1205,7 @@ index fa5395685..d7e04e1ce 100644
 @@ -1038,6 +1047,31 @@ class MambaManager(SingleTypeKVCacheManager):
      def new_step_starts(self) -> None:
          self.cached_blocks_this_step.clear()
- 
+
 +    def cache_prompt_tail_state(
 +        self, request_id: str, block_hash: BlockHash, src_block_idx: int
 +    ) -> int | None:
@@ -1209,7 +1231,7 @@ index fa5395685..d7e04e1ce 100644
 +            return
 +        self.block_pool.free_blocks([self.block_pool.blocks[block_id]])
 +
- 
+
  class CrossAttentionManager(SingleTypeKVCacheManager):
      """Manager for cross-attention KV cache in encoder-decoder models."""
 diff --git a/vllm/v1/engine/__init__.py b/vllm/v1/engine/__init__.py
@@ -1218,10 +1240,10 @@ index 114d45fc4..190ec6267 100644
 +++ b/vllm/v1/engine/__init__.py
 @@ -100,6 +100,7 @@ class EngineCoreRequest(
      external_req_id: str | None = None
- 
+
      reasoning_ended: bool | None = None
 +    prompt_tail_cache_stable_len: int | None = None
- 
+
      @property
      def params(self) -> SamplingParams | PoolingParams:
 diff --git a/vllm/v1/engine/input_processor.py b/vllm/v1/engine/input_processor.py
@@ -1236,7 +1258,7 @@ index b59d02a46..ead26df18 100644
 +                "prompt_tail_cache_stable_len"
 +            ),
          )
- 
+
      def _validate_prompt_len(
 diff --git a/vllm/v1/request.py b/vllm/v1/request.py
 index 946e71c15..5fa74e2f0 100644
@@ -1244,8 +1266,8 @@ index 946e71c15..5fa74e2f0 100644
 +++ b/vllm/v1/request.py
 @@ -28,6 +28,9 @@ if TYPE_CHECKING:
      from vllm.v1.core.kv_cache_utils import BlockHash
- 
- 
+
+
 +PROMPT_TAIL_CACHE_GRANULARITY = 16
 +
 +
@@ -1268,7 +1290,7 @@ index 946e71c15..5fa74e2f0 100644
 +        self.prompt_tail_cache_boundary = self._get_prompt_tail_cache_boundary()
 +        self.prompt_tail_cache_current_boundary: int | None = None
 +        self.prompt_tail_cache_published = False
- 
+
          # Multi-modal related
          self.mm_features = mm_features or []
 @@ -198,8 +206,18 @@ class Request:
@@ -1277,7 +1299,7 @@ index 946e71c15..5fa74e2f0 100644
              reasoning_ended=request.reasoning_ended,
 +            prompt_tail_cache_stable_len=request.prompt_tail_cache_stable_len,
          )
- 
+
 +    def _get_prompt_tail_cache_boundary(self) -> int | None:
 +        stable_len = self.prompt_tail_cache_stable_len
 +        if stable_len is None or stable_len <= 0:
@@ -1297,7 +1319,7 @@ index 2e62206da..31ed1c2ee 100644
 @@ -1041,6 +1041,60 @@ class GPUModelRunner(
          if hasattr(self, "_kv_block_zeroer"):
              self._kv_block_zeroer.zero_block_ids(block_ids)
- 
+
 +    def _copy_partial_kv_cache_blocks(
 +        self, scheduler_output: "SchedulerOutput"
 +    ) -> None:
@@ -1360,7 +1382,7 @@ index 2e62206da..31ed1c2ee 100644
          if scheduler_output.new_block_ids_to_zero:
              self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
 +        self._copy_partial_kv_cache_blocks(scheduler_output)
- 
+
          # Free the cached encoder outputs.
          for mm_hash in scheduler_output.free_encoder_mm_hashes:
 @@ -3951,6 +4006,14 @@ class GPUModelRunner(
@@ -1375,7 +1397,7 @@ index 2e62206da..31ed1c2ee 100644
 +                    self.model.get_mamba_state_copy_func(),
 +                    self._get_mamba_copy_bufs(),
 +                )
- 
+
              use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
              ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 @@ -4038,6 +4101,15 @@ class GPUModelRunner(
@@ -1391,7 +1413,7 @@ index 2e62206da..31ed1c2ee 100644
 +                self.model.get_mamba_state_copy_func(),
 +                self._get_mamba_copy_bufs(),
 +            )
- 
+
          with record_function_or_nullcontext("gpu_model_runner: postprocess"):
              if self.use_aux_hidden_state_outputs:
 diff --git a/vllm/v1/worker/mamba_utils.py b/vllm/v1/worker/mamba_utils.py
@@ -1400,8 +1422,8 @@ index c832389b1..085f5533f 100644
 +++ b/vllm/v1/worker/mamba_utils.py
 @@ -133,6 +133,74 @@ def collect_mamba_copy_meta(
      copy_bufs.offset = offset
- 
- 
+
+
 +def collect_mamba_copy_meta_to_block_id(
 +    copy_bufs: MambaCopyBuffers,
 +    kv_cache_config: KVCacheConfig,
@@ -1475,8 +1497,8 @@ index c832389b1..085f5533f 100644
      if n == 0:
 @@ -219,6 +287,67 @@ def preprocess_mamba(
      do_mamba_copy_block(copy_bufs)
- 
- 
+
+
 +def restore_prompt_tail_mamba_cache(
 +    scheduler_output: SchedulerOutput,
 +    kv_cache_config: KVCacheConfig,

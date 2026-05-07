@@ -1,5 +1,5 @@
 diff --git a/tests/v1/core/test_prefix_caching.py b/tests/v1/core/test_prefix_caching.py
-index b8b387fff..74c3df43e 100644
+index b8b387fff..467aa7398 100644
 --- a/tests/v1/core/test_prefix_caching.py
 +++ b/tests/v1/core/test_prefix_caching.py
 @@ -62,6 +62,7 @@ def make_request(
@@ -16,13 +16,13 @@ index b8b387fff..74c3df43e 100644
          block_hasher=get_request_block_hasher(block_size, hash_fn),
 +        prompt_tail_cache_stable_len=prompt_tail_cache_stable_len,
      )
- 
- 
-@@ -1008,6 +1010,85 @@ def test_prefill_hybrid_model_mamba_align():
+
+
+@@ -1008,6 +1010,171 @@ def test_prefill_hybrid_model_mamba_align():
      manager.free(req0)
- 
- 
-+def test_prompt_tail_cache_probes_previous_boundary_only():
+
+
++def test_prompt_tail_cache_probes_deepest_matching_boundary():
 +    block_size = 64
 +    kv_cache_config = _make_hybrid_kv_cache_config(
 +        block_size, 32, ["full", "mamba_align"]
@@ -101,9 +101,95 @@ index b8b387fff..74c3df43e 100644
 +    manager.free(req1)
 +
 +
++def test_prompt_tail_cache_uses_exact_prefix_not_cache_salt_lineage():
++    block_size = 64
++    kv_cache_config = _make_hybrid_kv_cache_config(
++        block_size, 64, ["full", "mamba_align"]
++    )
++    manager = KVCacheManager(
++        kv_cache_config,
++        max_model_len=8192,
++        enable_caching=True,
++        hash_block_size=block_size,
++    )
++
++    req0_token_ids = list(range(84))
++    req0 = make_request(
++        "prompt_tail_a0",
++        req0_token_ids,
++        block_size,
++        sha256,
++        cache_salt="shared-salt",
++        prompt_tail_cache_stable_len=80,
++    )
++    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req0)
++    assert num_computed_tokens == 0
++    blocks = manager.allocate_slots(
++        req0, 80, num_computed_tokens, computed_blocks
++    )
++    assert blocks is not None
++    copies = manager.take_mamba_prompt_cache_copies()
++    assert len(copies) == 1
++    manager.release_mamba_prompt_cache_copies(copies)
++    manager.free(req0)
++
++    req1_token_ids = list(range(1000, 1116))
++    req1 = make_request(
++        "prompt_tail_b0",
++        req1_token_ids,
++        block_size,
++        sha256,
++        cache_salt="shared-salt",
++        prompt_tail_cache_stable_len=112,
++    )
++    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
++    assert num_computed_tokens == 0
++    blocks = manager.allocate_slots(
++        req1, 112, num_computed_tokens, computed_blocks
++    )
++    assert blocks is not None
++    copies = manager.take_mamba_prompt_cache_copies()
++    assert len(copies) == 1
++    manager.release_mamba_prompt_cache_copies(copies)
++    manager.free(req1)
++
++    req2_token_ids = req0_token_ids + list(range(84, 124))
++    req2 = make_request(
++        "prompt_tail_a1",
++        req2_token_ids,
++        block_size,
++        sha256,
++        cache_salt="shared-salt",
++        prompt_tail_cache_stable_len=120,
++    )
++    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req2)
++    assert num_computed_tokens == 80
++    assert len(computed_blocks.blocks[0]) == 0
++    assert [block.is_null for block in computed_blocks.blocks[1]] == [True]
++
++    blocks = manager.allocate_slots(
++        req2, 32, num_computed_tokens, computed_blocks
++    )
++    assert blocks is not None
++
++    copy_ops = manager.take_kv_cache_block_copy_ops()
++    assert len(copy_ops) == 1
++    assert copy_ops[0].kv_cache_group_id == 0
++    assert copy_ops[0].num_tokens == 16
++
++    restores = manager.take_mamba_prompt_cache_restores()
++    assert len(restores) == 1
++    manager.release_mamba_prompt_cache_restores(restores)
++
++    copies = manager.take_mamba_prompt_cache_copies()
++    assert len(copies) == 1
++    manager.release_mamba_prompt_cache_copies(copies)
++    manager.free(req2)
++
++
  def test_prefill_plp():
      """Test prefill with APC and some prompt logprobs (plp) requests.
- 
+
 diff --git a/tests/v1/spec_decode/test_mtp_prefix_cache_config.py b/tests/v1/spec_decode/test_mtp_prefix_cache_config.py
 new file mode 100644
 index 000000000..ecdd01e02
